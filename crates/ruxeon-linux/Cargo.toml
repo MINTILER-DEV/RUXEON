@@ -7,5 +7,6 @@ repository.workspace = true
 
 [dependencies]
 ruxeon-core = { path = "../ruxeon-core" }
+ruxeon-cpu = { path = "../ruxeon-cpu" }
 ruxeon-fs = { path = "../ruxeon-fs" }
 thiserror.workspace = true

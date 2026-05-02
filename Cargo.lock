@@ -222,6 +222,7 @@ name = "ruxeon-linux"
 version = "0.1.0"
 dependencies = [
  "ruxeon-core",
+ "ruxeon-cpu",
  "ruxeon-fs",
  "thiserror",
 ]

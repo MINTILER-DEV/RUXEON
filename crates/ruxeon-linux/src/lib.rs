@@ -1,9 +1,10 @@
 //! Linux syscall layer for the user-mode runtime.
 
 use ruxeon_core::{GuestMemory, GuestMemoryError, MemoryPermission, PAGE_SIZE};
+use ruxeon_cpu::Registers;
 use ruxeon_fs::{FsError, GuestPath, ResolvedPath, RootFs, VirtualFile};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -466,6 +467,22 @@ impl LinuxProcess {
         &mut self.fd_table
     }
 
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub fn tid(&self) -> u32 {
+        self.tid
+    }
+
+    pub fn ppid(&self) -> u32 {
+        self.ppid
+    }
+
+    pub fn pgid(&self) -> u32 {
+        self.pgid
+    }
+
     pub fn trace(&self) -> &[SyscallTrace] {
         &self.trace
     }
@@ -474,6 +491,299 @@ impl LinuxProcess {
         self.executable_path = executable_path.into();
         self.fd_table.close_on_exec();
         self.fs_base = 0;
+    }
+
+    fn try_clone_for_child(&self, child_pid: u32) -> Result<Self, SyscallError> {
+        Ok(Self {
+            pid: child_pid,
+            tid: child_pid,
+            ppid: self.pid,
+            pgid: self.pgid,
+            next_child_pid: child_pid + 1,
+            cwd: self.cwd.clone(),
+            rootfs: self.rootfs.clone(),
+            executable_path: self.executable_path.clone(),
+            brk_base: self.brk_base,
+            brk: self.brk,
+            mmap_next: self.mmap_next,
+            fs_base: self.fs_base,
+            fd_table: self.fd_table.duplicate_all()?,
+            trace: Vec::new(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProcessId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ThreadId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessState {
+    Runnable,
+    Waiting,
+    Exited,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExitStatus {
+    pub code: i32,
+}
+
+impl ExitStatus {
+    pub fn wait_status(self) -> u32 {
+        ((self.code as u32) & 0xff) << 8
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SignalState {
+    pending: Vec<i32>,
+}
+
+impl SignalState {
+    pub fn pending(&self) -> &[i32] {
+        &self.pending
+    }
+
+    pub fn enqueue(&mut self, signal: i32) {
+        self.pending.push(signal);
+    }
+
+    pub fn take_next(&mut self) -> Option<i32> {
+        if self.pending.is_empty() {
+            None
+        } else {
+            Some(self.pending.remove(0))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinuxThread {
+    pub tid: ThreadId,
+    pub process_id: ProcessId,
+    pub registers: Registers,
+    pub state: ProcessState,
+}
+
+#[derive(Debug)]
+pub struct ProcessRecord {
+    pub process: LinuxProcess,
+    pub memory: GuestMemory,
+    pub threads: HashMap<ThreadId, LinuxThread>,
+    pub parent: Option<ProcessId>,
+    pub children: Vec<ProcessId>,
+    pub state: ProcessState,
+    pub exit_status: Option<ExitStatus>,
+    pub signal_state: SignalState,
+}
+
+#[derive(Debug, Default)]
+pub struct WaitQueue {
+    exited: VecDeque<(ProcessId, ExitStatus)>,
+}
+
+impl WaitQueue {
+    pub fn push(&mut self, pid: ProcessId, status: ExitStatus) {
+        self.exited.push_back((pid, status));
+    }
+
+    pub fn pop_matching(
+        &mut self,
+        requested: Option<ProcessId>,
+    ) -> Option<(ProcessId, ExitStatus)> {
+        let index = self
+            .exited
+            .iter()
+            .position(|(pid, _)| requested.map(|requested| requested == *pid).unwrap_or(true))?;
+        self.exited.remove(index)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ProcessTable {
+    records: HashMap<ProcessId, ProcessRecord>,
+    wait_queues: HashMap<ProcessId, WaitQueue>,
+    next_pid: u32,
+}
+
+impl ProcessTable {
+    pub fn new() -> Self {
+        Self {
+            records: HashMap::new(),
+            wait_queues: HashMap::new(),
+            next_pid: 1000,
+        }
+    }
+
+    pub fn insert_initial(
+        &mut self,
+        process: LinuxProcess,
+        memory: GuestMemory,
+        registers: Registers,
+    ) -> ProcessId {
+        let pid = ProcessId(process.pid);
+        self.next_pid = self.next_pid.max(process.pid + 1);
+        let tid = ThreadId(process.tid);
+        let mut threads = HashMap::new();
+        threads.insert(
+            tid,
+            LinuxThread {
+                tid,
+                process_id: pid,
+                registers,
+                state: ProcessState::Runnable,
+            },
+        );
+        self.records.insert(
+            pid,
+            ProcessRecord {
+                process,
+                memory,
+                threads,
+                parent: None,
+                children: Vec::new(),
+                state: ProcessState::Runnable,
+                exit_status: None,
+                signal_state: SignalState::default(),
+            },
+        );
+        self.wait_queues.entry(pid).or_default();
+        pid
+    }
+
+    pub fn records(&self) -> &HashMap<ProcessId, ProcessRecord> {
+        &self.records
+    }
+
+    pub fn get(&self, pid: ProcessId) -> Option<&ProcessRecord> {
+        self.records.get(&pid)
+    }
+
+    pub fn get_mut(&mut self, pid: ProcessId) -> Option<&mut ProcessRecord> {
+        self.records.get_mut(&pid)
+    }
+
+    pub fn fork_from_process(
+        &mut self,
+        parent: &LinuxProcess,
+        memory: &GuestMemory,
+        registers: Registers,
+    ) -> Result<ProcessId, SyscallError> {
+        let child_pid = self.allocate_pid();
+        let child_process = parent.try_clone_for_child(child_pid.0)?;
+        let mut child_registers = registers;
+        child_registers.rax = 0;
+        let tid = ThreadId(child_process.tid);
+        let mut threads = HashMap::new();
+        threads.insert(
+            tid,
+            LinuxThread {
+                tid,
+                process_id: child_pid,
+                registers: child_registers,
+                state: ProcessState::Runnable,
+            },
+        );
+        self.records.insert(
+            child_pid,
+            ProcessRecord {
+                process: child_process,
+                memory: memory.clone(),
+                threads,
+                parent: Some(ProcessId(parent.pid)),
+                children: Vec::new(),
+                state: ProcessState::Runnable,
+                exit_status: None,
+                signal_state: SignalState::default(),
+            },
+        );
+        self.wait_queues.entry(child_pid).or_default();
+        self.wait_queues.entry(ProcessId(parent.pid)).or_default();
+        if let Some(parent_record) = self.records.get_mut(&ProcessId(parent.pid)) {
+            parent_record.children.push(child_pid);
+        }
+        Ok(child_pid)
+    }
+
+    pub fn exit_process(&mut self, pid: ProcessId, code: i32) {
+        let status = ExitStatus { code };
+        let parent = self.records.get(&pid).and_then(|record| record.parent);
+        if let Some(record) = self.records.get_mut(&pid) {
+            record.state = ProcessState::Exited;
+            record.exit_status = Some(status);
+            for thread in record.threads.values_mut() {
+                thread.state = ProcessState::Exited;
+            }
+        }
+        if let Some(parent) = parent {
+            self.wait_queues
+                .entry(parent)
+                .or_default()
+                .push(pid, status);
+        }
+    }
+
+    pub fn wait4(
+        &mut self,
+        parent: ProcessId,
+        requested: Option<ProcessId>,
+    ) -> Option<(ProcessId, ExitStatus)> {
+        self.wait_queues
+            .get_mut(&parent)
+            .and_then(|queue| queue.pop_matching(requested))
+    }
+
+    fn allocate_pid(&mut self) -> ProcessId {
+        loop {
+            let pid = ProcessId(self.next_pid);
+            self.next_pid += 1;
+            if !self.records.contains_key(&pid) {
+                return pid;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct Scheduler {
+    run_queue: VecDeque<(ProcessId, ThreadId)>,
+}
+
+impl Scheduler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn enqueue(&mut self, pid: ProcessId, tid: ThreadId) {
+        if !self.run_queue.contains(&(pid, tid)) {
+            self.run_queue.push_back((pid, tid));
+        }
+    }
+
+    pub fn enqueue_process(&mut self, record: &ProcessRecord) {
+        for thread in record.threads.values() {
+            if thread.state == ProcessState::Runnable {
+                self.enqueue(thread.process_id, thread.tid);
+            }
+        }
+    }
+
+    pub fn next_thread(&mut self, table: &ProcessTable) -> Option<(ProcessId, ThreadId)> {
+        while let Some((pid, tid)) = self.run_queue.pop_front() {
+            let runnable = table
+                .get(pid)
+                .and_then(|record| record.threads.get(&tid))
+                .map(|thread| thread.state == ProcessState::Runnable)
+                .unwrap_or(false);
+            if runnable {
+                self.run_queue.push_back((pid, tid));
+                return Some((pid, tid));
+            }
+        }
+        None
     }
 }
 
@@ -486,8 +796,25 @@ impl SyscallDispatcher {
         context: &mut SyscallContext<'_>,
         input: SyscallInput,
     ) -> SyscallOutcome {
+        Self::dispatch_with_process_model(process, context, input, None, None)
+    }
+
+    pub fn dispatch_with_process_model(
+        process: &mut LinuxProcess,
+        context: &mut SyscallContext<'_>,
+        input: SyscallInput,
+        process_table: Option<&mut ProcessTable>,
+        registers: Option<Registers>,
+    ) -> SyscallOutcome {
         let number = SyscallNumber::from(input.number);
-        let outcome = match Self::dispatch_inner(process, context, number, input.args) {
+        let outcome = match Self::dispatch_inner(
+            process,
+            context,
+            number,
+            input.args,
+            process_table,
+            registers,
+        ) {
             Ok(outcome) => outcome,
             Err(SyscallError::Errno(errno)) => SyscallOutcome::Return(errno.linux_return()),
             Err(SyscallError::Memory(_)) => SyscallOutcome::Return(Errno::Fault.linux_return()),
@@ -506,7 +833,10 @@ impl SyscallDispatcher {
         context: &mut SyscallContext<'_>,
         number: SyscallNumber,
         args: [u64; 6],
+        process_table: Option<&mut ProcessTable>,
+        registers: Option<Registers>,
     ) -> Result<SyscallOutcome, SyscallError> {
+        let mut process_table = process_table;
         let value = match number {
             SyscallNumber::Read => {
                 let fd = fd_arg(args[0])?;
@@ -590,6 +920,9 @@ impl SyscallDispatcher {
                 0
             }
             SyscallNumber::Exit | SyscallNumber::ExitGroup => {
+                if let Some(table) = process_table.as_deref_mut() {
+                    table.exit_process(ProcessId(process.pid), args[0] as i32);
+                }
                 return Ok(SyscallOutcome::Exit(args[0] as i32));
             }
             SyscallNumber::Brk => process.brk(context.memory, args[0])? as i64,
@@ -721,16 +1054,33 @@ impl SyscallDispatcher {
             }
             SyscallNumber::Select | SyscallNumber::Pselect6 => 0,
             SyscallNumber::Wait4 => {
-                if args[1] != 0 {
-                    context.memory.write_u32(args[1], 0)?;
+                let requested = wait_requested_pid(args[0]);
+                if let Some(table) = process_table.as_deref_mut() {
+                    if let Some((pid, status)) = table.wait4(ProcessId(process.pid), requested) {
+                        if args[1] != 0 {
+                            context.memory.write_u32(args[1], status.wait_status())?;
+                        }
+                        pid.0 as i64
+                    } else {
+                        0
+                    }
+                } else {
+                    if args[1] != 0 {
+                        context.memory.write_u32(args[1], 0)?;
+                    }
+                    0
                 }
-                0
             }
             SyscallNumber::Kill => 0,
             SyscallNumber::Clone | SyscallNumber::Fork | SyscallNumber::VFork => {
-                let pid = process.next_child_pid;
-                process.next_child_pid += 1;
-                i64::from(pid)
+                if let (Some(table), Some(registers)) = (process_table.as_deref_mut(), registers) {
+                    let pid = table.fork_from_process(process, context.memory, registers)?;
+                    pid.0 as i64
+                } else {
+                    let pid = process.next_child_pid;
+                    process.next_child_pid += 1;
+                    i64::from(pid)
+                }
             }
             SyscallNumber::Execve => {
                 let guest_path = read_c_string(context.memory, args[0])?;
@@ -873,6 +1223,24 @@ impl FdTable {
     pub fn close_on_exec(&mut self) {
         self.entries
             .retain(|fd, slot| *fd <= 2 || !slot.close_on_exec);
+    }
+
+    pub fn duplicate_all(&self) -> Result<Self, SyscallError> {
+        let mut entries = HashMap::new();
+        for (fd, slot) in &self.entries {
+            entries.insert(
+                *fd,
+                FdSlot {
+                    entry: slot.entry.duplicate()?,
+                    close_on_exec: slot.close_on_exec,
+                    status_flags: slot.status_flags,
+                },
+            );
+        }
+        Ok(Self {
+            entries,
+            next_fd: self.next_fd,
+        })
     }
 
     pub fn poll_events(&self, fd: i32, requested: i16) -> i16 {
@@ -1616,6 +1984,15 @@ fn poll_fds(
     Ok(ready)
 }
 
+fn wait_requested_pid(raw: u64) -> Option<ProcessId> {
+    let value = raw as i64;
+    if value <= 0 {
+        None
+    } else {
+        Some(ProcessId(value as u32))
+    }
+}
+
 fn fd_arg(value: u64) -> Result<i32, SyscallError> {
     i32::try_from(value).map_err(|_| Errno::Badf.into())
 }
@@ -2012,5 +2389,108 @@ mod tests {
         assert_eq!(request.host_path, root.join("bin/sh"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn process_table_forks_snapshots_and_waits_for_exit() {
+        let parent = LinuxProcess::new(None);
+        let memory = memory_with_data(0x1000, b"parent");
+        let registers = Registers {
+            rip: 0x4000,
+            rax: 123,
+            ..Registers::default()
+        };
+        let mut table = ProcessTable::new();
+        let parent_pid = table.insert_initial(LinuxProcess::new(None), memory.clone(), registers);
+
+        let child_pid = table
+            .fork_from_process(&parent, &memory, registers)
+            .unwrap();
+
+        let child = table.get(child_pid).unwrap();
+        assert_eq!(child.parent, Some(parent_pid));
+        assert_eq!(child.memory.read_bytes(0x1000, 6).unwrap(), b"parent");
+        let child_thread = child.threads.values().next().unwrap();
+        assert_eq!(child_thread.registers.rax, 0);
+
+        table.exit_process(child_pid, 7);
+        let waited = table.wait4(parent_pid, Some(child_pid)).unwrap();
+        assert_eq!(waited.0, child_pid);
+        assert_eq!(waited.1.wait_status(), 7 << 8);
+    }
+
+    #[test]
+    fn scheduler_round_robins_runnable_threads() {
+        let process = LinuxProcess::new(None);
+        let memory = GuestMemory::new();
+        let mut table = ProcessTable::new();
+        let pid = table.insert_initial(process, memory, Registers::default());
+        let mut scheduler = Scheduler::new();
+        scheduler.enqueue_process(table.get(pid).unwrap());
+
+        assert_eq!(scheduler.next_thread(&table).unwrap().0, pid);
+        table.exit_process(pid, 0);
+        assert_eq!(scheduler.next_thread(&table), None);
+    }
+
+    #[test]
+    fn dispatch_fork_and_wait_use_process_table() {
+        let mut process = LinuxProcess::new(None);
+        let mut memory = memory_with_data(0x1000, &[0; 16]);
+        let registers = Registers {
+            rip: 0x401000,
+            rsp: 0x8000,
+            ..Registers::default()
+        };
+        let mut table = ProcessTable::new();
+        let parent_pid = table.insert_initial(LinuxProcess::new(None), memory.clone(), registers);
+        assert_eq!(parent_pid, ProcessId(process.pid()));
+
+        let forked = SyscallDispatcher::dispatch_with_process_model(
+            &mut process,
+            &mut SyscallContext {
+                memory: &mut memory,
+            },
+            SyscallInput {
+                number: SyscallNumber::Fork.raw(),
+                args: [0; 6],
+            },
+            Some(&mut table),
+            Some(registers),
+        );
+        let SyscallOutcome::Return(child_pid) = forked else {
+            panic!("expected child pid");
+        };
+        let child_pid = ProcessId(child_pid as u32);
+        assert!(table.get(child_pid).is_some());
+
+        table.exit_process(child_pid, 3);
+        let waited = SyscallDispatcher::dispatch_with_process_model(
+            &mut process,
+            &mut SyscallContext {
+                memory: &mut memory,
+            },
+            SyscallInput {
+                number: SyscallNumber::Wait4.raw(),
+                args: [child_pid.0 as u64, 0x1000, 0, 0, 0, 0],
+            },
+            Some(&mut table),
+            Some(registers),
+        );
+
+        assert_eq!(waited, SyscallOutcome::Return(child_pid.0 as i64));
+        assert_eq!(memory.read_u32(0x1000).unwrap(), 3 << 8);
+    }
+
+    #[test]
+    fn signal_state_queues_and_takes_signals() {
+        let mut signals = SignalState::default();
+        signals.enqueue(2);
+        signals.enqueue(15);
+
+        assert_eq!(signals.pending(), &[2, 15]);
+        assert_eq!(signals.take_next(), Some(2));
+        assert_eq!(signals.take_next(), Some(15));
+        assert_eq!(signals.take_next(), None);
     }
 }

@@ -4,7 +4,8 @@ use ruxeon_cpu::{Interpreter, Registers, StepOutcome};
 use ruxeon_elf::{ElfImage, LoadedProgram};
 use ruxeon_fs::{GuestPath, ResolvedPath, RootFs};
 use ruxeon_linux::{
-    ExecveRequest, LinuxProcess, SyscallContext, SyscallDispatcher, SyscallInput, SyscallOutcome,
+    ExecveRequest, LinuxProcess, ProcessTable, Scheduler, SyscallContext, SyscallDispatcher,
+    SyscallInput, SyscallOutcome,
 };
 use std::{fs, path::PathBuf};
 
@@ -76,9 +77,25 @@ fn run_program(
     };
     let mut interpreter = Interpreter::new(loaded.memory, registers);
     interpreter.set_trace_enabled(trace);
-    let mut process = LinuxProcess::with_executable(rootfs, program.to_string_lossy().to_string());
+    let mut process =
+        LinuxProcess::with_executable(rootfs.clone(), program.to_string_lossy().to_string());
+    let mut process_table = ProcessTable::new();
+    let initial_pid = process_table.insert_initial(
+        LinuxProcess::with_executable(rootfs, program.to_string_lossy().to_string()),
+        interpreter.memory().clone(),
+        *interpreter.registers(),
+    );
+    let mut scheduler = Scheduler::new();
+    if let Some(record) = process_table.get(initial_pid) {
+        scheduler.enqueue_process(record);
+    }
 
-    let exit_code = run_until_exit(&mut interpreter, &mut process)?;
+    let exit_code = run_until_exit(
+        &mut interpreter,
+        &mut process,
+        &mut process_table,
+        &mut scheduler,
+    )?;
     if trace {
         for record in interpreter.trace() {
             println!(
@@ -112,13 +129,19 @@ fn run_program(
     }
 }
 
-fn run_until_exit(interpreter: &mut Interpreter, process: &mut LinuxProcess) -> Result<i32> {
+fn run_until_exit(
+    interpreter: &mut Interpreter,
+    process: &mut LinuxProcess,
+    process_table: &mut ProcessTable,
+    scheduler: &mut Scheduler,
+) -> Result<i32> {
     for _ in 0..DEFAULT_MAX_STEPS {
         match interpreter.step()? {
             StepOutcome::Continue => {}
             StepOutcome::Halted(code) => return Ok(code),
             StepOutcome::Syscall(trap) => {
-                let outcome = SyscallDispatcher::dispatch(
+                let registers = *interpreter.registers();
+                let outcome = SyscallDispatcher::dispatch_with_process_model(
                     process,
                     &mut SyscallContext {
                         memory: interpreter.memory_mut(),
@@ -127,7 +150,12 @@ fn run_until_exit(interpreter: &mut Interpreter, process: &mut LinuxProcess) -> 
                         number: trap.number,
                         args: trap.args,
                     },
+                    Some(process_table),
+                    Some(registers),
                 );
+                if let Some(record) = process_table.records().values().last() {
+                    scheduler.enqueue_process(record);
+                }
                 match outcome {
                     SyscallOutcome::Return(value) => {
                         interpreter.registers_mut().rax = value as u64;
