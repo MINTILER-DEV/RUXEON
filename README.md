@@ -5,7 +5,7 @@ Ruxeon is a Rust-based Linux user-mode runtime for Windows. The first milestone 
 The long-term target is:
 
 ```powershell
-ruxeon run --rootfs ./rootfs /bin/bash
+ruxeon run --rootfs ./rootfs /bin/sh
 ```
 
 ## Current Status
@@ -25,9 +25,11 @@ Implemented:
 - Process model objects for PID allocation, parent/child records, wait queues, signal state, Linux threads, and cooperative scheduler queues.
 - CLI scheduler execution for runnable process snapshots created by `fork`/`clone`/`vfork`.
 - Terminal support with Linux-shaped `termios`, `TCGETS`/`TCSETS`, `TIOCGWINSZ`/`TIOCSWINSZ`, host window-size queries, raw-mode toggling, ANSI byte pass-through, and blocking stdin by default.
+- Phase 9 IR block metadata, block translation, decoded block cache, cache stats, cached basic-block execution, and invalidation for guest writes to executable memory.
+- Phase 10 rootfs setup docs and an Alpine minirootfs setup script.
 - CLI commands for `run`, `trace`, and `shell` scaffolding.
 
-Later phases will deepen dynamic linker compatibility and add performance-oriented IR execution.
+Later phases will deepen dynamic linker compatibility and optional full-system VM design.
 
 ## Build
 
@@ -45,7 +47,7 @@ cargo test
 
 ```powershell
 cargo run -p ruxeon-cli -- run ./program
-cargo run -p ruxeon-cli -- run --rootfs ./rootfs /bin/bash
+cargo run -p ruxeon-cli -- run --rootfs ./rootfs /bin/sh
 cargo run -p ruxeon-cli -- shell --rootfs ./rootfs
 cargo run -p ruxeon-cli -- trace ./program
 ```
@@ -57,6 +59,19 @@ Dynamically linked ELFs are recognized through `PT_INTERP`; when `--rootfs` is p
 `execve` reloads a new ELF into the current process and rebuilds guest memory/stack while preserving non-close-on-exec file descriptors. `fork`/`clone`/`vfork` create process-table snapshots with copied guest memory, copied registers, duplicated file descriptors, parent/child relationships, and waitable exit status. The CLI scheduler runs runnable snapshots cooperatively.
 
 Terminal ioctls are backed by a per-process terminal state and the host console where available. Guest writes pass ANSI sequences through unchanged, `TCSETS` can switch the host console into raw mode for interactive shells, and the CLI restores the host terminal mode when a guest exits.
+
+The CPU can translate straight-line x86 instruction ranges into RUXEON IR block metadata, cache decoded blocks by guest RIP, execute cached basic blocks until a branch/syscall/return boundary, and invalidate the cache when guest code writes into executable memory.
+
+## Rootfs
+
+Create an Alpine rootfs:
+
+```powershell
+.\scripts\setup-alpine-rootfs.ps1 -Rootfs .\rootfs\alpine
+cargo run -p ruxeon-cli -- run --rootfs .\rootfs\alpine /bin/busybox sh
+```
+
+See [docs/rootfs.md](docs/rootfs.md) for Alpine and Debian notes.
 
 ## Fixtures
 

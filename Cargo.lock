@@ -314,6 +314,7 @@ version = "0.1.0"
 dependencies = [
  "iced-x86",
  "ruxeon-core",
+ "ruxeon-ir",
  "thiserror",
 ]
 

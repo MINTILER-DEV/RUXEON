@@ -5,10 +5,16 @@ use iced_x86::{
     Code, Decoder, DecoderOptions, Formatter, Instruction, Mnemonic, NasmFormatter, OpKind,
     Register,
 };
-use ruxeon_core::{GuestMemory, GuestMemoryError};
+use ruxeon_core::{GuestMemory, GuestMemoryError, MemoryPermission};
+use ruxeon_ir::{
+    BasicBlock, BasicBlockId, BlockCache, BlockCacheStats, BlockTerminator, IrInstruction,
+    IrInstructionKind,
+};
+use std::collections::HashMap;
 use thiserror::Error;
 
 const MAX_INSTRUCTION_LEN: usize = 15;
+const MAX_BLOCK_INSTRUCTIONS: usize = 64;
 
 #[derive(Debug, Error)]
 pub enum CpuError {
@@ -54,20 +60,43 @@ pub enum RunOutcome {
     StepLimit,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ExecutionCache {
+    ir: BlockCache,
+    decoded: HashMap<BasicBlockId, Vec<Instruction>>,
+}
+
+impl ExecutionCache {
+    pub fn stats(&self) -> BlockCacheStats {
+        self.ir.stats()
+    }
+
+    pub fn clear(&mut self) {
+        self.ir.clear();
+        self.decoded.clear();
+    }
+}
+
 pub struct Interpreter {
     memory: GuestMemory,
     registers: Registers,
     trace_enabled: bool,
     trace: Vec<TraceRecord>,
+    cache: ExecutionCache,
 }
 
 impl Interpreter {
     pub fn new(memory: GuestMemory, registers: Registers) -> Self {
+        Self::with_cache(memory, registers, ExecutionCache::default())
+    }
+
+    pub fn with_cache(memory: GuestMemory, registers: Registers, cache: ExecutionCache) -> Self {
         Self {
             memory,
             registers,
             trace_enabled: false,
             trace: Vec::new(),
+            cache,
         }
     }
 
@@ -91,10 +120,15 @@ impl Interpreter {
         self.memory = memory;
         self.registers = registers;
         self.trace.clear();
+        self.cache.clear();
     }
 
     pub fn into_parts(self) -> (GuestMemory, Registers, Vec<TraceRecord>) {
         (self.memory, self.registers, self.trace)
+    }
+
+    pub fn into_state(self) -> (GuestMemory, Registers, Vec<TraceRecord>, ExecutionCache) {
+        (self.memory, self.registers, self.trace, self.cache)
     }
 
     pub fn set_trace_enabled(&mut self, enabled: bool) {
@@ -103,6 +137,14 @@ impl Interpreter {
 
     pub fn trace(&self) -> &[TraceRecord] {
         &self.trace
+    }
+
+    pub fn cache_stats(&self) -> BlockCacheStats {
+        self.cache.stats()
+    }
+
+    pub fn clear_block_cache(&mut self) {
+        self.cache.clear();
     }
 
     pub fn step(&mut self) -> Result<StepOutcome, CpuError> {
@@ -126,13 +168,40 @@ impl Interpreter {
         Ok(outcome)
     }
 
+    pub fn step_block(&mut self) -> Result<StepOutcome, CpuError> {
+        let start_ip = self.registers.rip;
+        let (block, instructions) = self.cached_block(start_ip)?;
+        for (index, instruction) in instructions.iter().enumerate() {
+            if self.registers.rip != instruction.ip() {
+                break;
+            }
+            let text = &block.instructions[index].text;
+            let before = self.registers;
+            let outcome = self.execute(instruction, text)?;
+            if self.trace_enabled {
+                self.trace.push(TraceRecord {
+                    ip: instruction.ip(),
+                    instruction: text.clone(),
+                    before,
+                    after: self.registers,
+                });
+            }
+            if outcome != StepOutcome::Continue
+                || block.instructions[index].kind != IrInstructionKind::Compute
+            {
+                return Ok(outcome);
+            }
+        }
+        Ok(StepOutcome::Continue)
+    }
+
     pub fn run(&mut self, max_steps: u64) -> Result<RunOutcome, CpuError> {
         if max_steps == 0 {
             return Err(CpuError::EmptyStepLimit);
         }
 
         for _ in 0..max_steps {
-            match self.step()? {
+            match self.step_block()? {
                 StepOutcome::Continue => {}
                 StepOutcome::Halted(code) => return Ok(RunOutcome::Exited(code)),
                 StepOutcome::Syscall(trap) if trap.number == 60 || trap.number == 231 => {
@@ -148,6 +217,46 @@ impl Interpreter {
         let bytes = self.memory.fetch_bytes(ip, MAX_INSTRUCTION_LEN)?;
         let mut decoder = Decoder::with_ip(64, &bytes, ip, DecoderOptions::NONE);
         Ok(decoder.decode())
+    }
+
+    fn cached_block(&mut self, ip: u64) -> Result<(BasicBlock, Vec<Instruction>), CpuError> {
+        let id = BasicBlockId(ip);
+        if let Some(block) = self.cache.ir.get(id) {
+            if let Some(decoded) = self.cache.decoded.get(&id) {
+                return Ok((block, decoded.clone()));
+            }
+        }
+        let (block, decoded) = self.translate_block(ip)?;
+        self.cache.ir.insert(block.clone());
+        self.cache.decoded.insert(id, decoded.clone());
+        Ok((block, decoded))
+    }
+
+    fn translate_block(&self, start_ip: u64) -> Result<(BasicBlock, Vec<Instruction>), CpuError> {
+        let mut ip = start_ip;
+        let mut ir = Vec::new();
+        let mut decoded = Vec::new();
+        let mut terminator = BlockTerminator::FallThrough;
+        for _ in 0..MAX_BLOCK_INSTRUCTIONS {
+            let instruction = self.decode(ip)?;
+            if instruction.code() == Code::INVALID {
+                return Err(CpuError::InvalidInstruction(ip));
+            }
+            let kind = instruction_kind(&instruction);
+            terminator = block_terminator(kind);
+            ir.push(IrInstruction {
+                ip,
+                len: instruction.len() as u8,
+                text: format_instruction(&instruction),
+                kind,
+            });
+            ip = instruction.next_ip();
+            decoded.push(instruction);
+            if kind != IrInstructionKind::Compute {
+                break;
+            }
+        }
+        Ok((BasicBlock::new(start_ip, ir, terminator), decoded))
     }
 
     fn execute(&mut self, instruction: &Instruction, text: &str) -> Result<StepOutcome, CpuError> {
@@ -360,7 +469,15 @@ impl Interpreter {
                 let size = memory_size(instruction, width)?;
                 let address = self.effective_address(instruction)?;
                 let bytes = u64_to_little_endian(value, size);
+                let invalidate_cache = self
+                    .memory
+                    .permissions_at(address)
+                    .map(MemoryPermission::executable)
+                    .unwrap_or(false);
                 self.memory.write_bytes(address, &bytes)?;
+                if invalidate_cache {
+                    self.cache.clear();
+                }
             }
             _ => {
                 return Err(CpuError::UnsupportedOperand {
@@ -533,6 +650,27 @@ fn is_jcc(mnemonic: Mnemonic) -> bool {
     )
 }
 
+fn instruction_kind(instruction: &Instruction) -> IrInstructionKind {
+    match instruction.mnemonic() {
+        Mnemonic::Syscall => IrInstructionKind::Syscall,
+        Mnemonic::Jmp => IrInstructionKind::Branch,
+        Mnemonic::Call => IrInstructionKind::Call,
+        Mnemonic::Ret => IrInstructionKind::Return,
+        mnemonic if is_jcc(mnemonic) => IrInstructionKind::Branch,
+        _ => IrInstructionKind::Compute,
+    }
+}
+
+fn block_terminator(kind: IrInstructionKind) -> BlockTerminator {
+    match kind {
+        IrInstructionKind::Compute => BlockTerminator::FallThrough,
+        IrInstructionKind::Branch => BlockTerminator::Branch,
+        IrInstructionKind::Call => BlockTerminator::Call,
+        IrInstructionKind::Return => BlockTerminator::Return,
+        IrInstructionKind::Syscall => BlockTerminator::Syscall,
+    }
+}
+
 fn memory_size(instruction: &Instruction, fallback_width: u32) -> Result<usize, CpuError> {
     let size = instruction.memory_size().size();
     if size != 0 {
@@ -683,5 +821,62 @@ mod tests {
         assert_eq!(cpu.run(8).unwrap(), RunOutcome::Exited(0));
         assert_eq!(cpu.trace().len(), 3);
         assert!(cpu.trace()[0].instruction.contains("mov"));
+    }
+
+    #[test]
+    fn cached_blocks_are_reused_by_rip() {
+        let mut cpu = interpreter(&[
+            0x90, // nop
+            0xeb, 0xfd, // jmp 0x1000
+        ]);
+
+        assert_eq!(cpu.step_block().unwrap(), StepOutcome::Continue);
+        assert_eq!(cpu.step_block().unwrap(), StepOutcome::Continue);
+
+        let stats = cpu.cache_stats();
+        assert_eq!(stats.blocks, 1);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.hits, 1);
+    }
+
+    #[test]
+    fn writes_to_executable_memory_invalidate_cached_blocks() {
+        let mut memory = GuestMemory::new();
+        memory
+            .map_region(
+                CODE,
+                0x1000,
+                MemoryPermission::READ | MemoryPermission::WRITE | MemoryPermission::EXECUTE,
+                Some("rwx-code".to_string()),
+            )
+            .unwrap();
+        memory
+            .load_bytes(
+                CODE,
+                &[
+                    0xc6, 0x05, 0x00, 0x00, 0x00, 0x00, 0x90, // mov byte [rip], 0x90
+                    0xb8, 0x3c, 0x00, 0x00, 0x00, // mov eax, 60
+                    0x31, 0xff, // xor edi, edi
+                    0x0f, 0x05, // syscall
+                ],
+            )
+            .unwrap();
+        memory
+            .map_region(
+                STACK,
+                0x1000,
+                MemoryPermission::READ | MemoryPermission::WRITE,
+                Some("stack".to_string()),
+            )
+            .unwrap();
+        let registers = Registers {
+            rip: CODE,
+            rsp: STACK + 0x800,
+            ..Registers::default()
+        };
+        let mut cpu = Interpreter::new(memory, registers);
+
+        assert_eq!(cpu.run(4).unwrap(), RunOutcome::Exited(0));
+        assert_eq!(cpu.cache_stats().invalidations, 1);
     }
 }

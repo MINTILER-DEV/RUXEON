@@ -8,4 +8,5 @@ repository.workspace = true
 [dependencies]
 iced-x86.workspace = true
 ruxeon-core = { path = "../ruxeon-core" }
+ruxeon-ir = { path = "../ruxeon-ir" }
 thiserror.workspace = true

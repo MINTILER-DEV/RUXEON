@@ -1,14 +1,14 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use ruxeon_core::GuestMemory;
-use ruxeon_cpu::{Interpreter, Registers, StepOutcome, TraceRecord};
+use ruxeon_cpu::{ExecutionCache, Interpreter, Registers, StepOutcome, TraceRecord};
 use ruxeon_elf::{ElfImage, LoadedProgram};
 use ruxeon_fs::{GuestPath, ResolvedPath, RootFs};
 use ruxeon_linux::{
     ExecveRequest, LinuxProcess, ProcessId, ProcessRecord, ProcessState, ProcessTable, Scheduler,
     SyscallContext, SyscallDispatcher, SyscallInput, SyscallOutcome,
 };
-use std::{fs, path::PathBuf};
+use std::{collections::HashMap, fs, path::PathBuf};
 
 const DEFAULT_MAX_STEPS: u64 = 1_000_000;
 
@@ -48,7 +48,7 @@ fn main() -> Result<()> {
             args,
         } => run_program(rootfs, program, args, false),
         Command::Shell { rootfs } => {
-            run_program(Some(rootfs), PathBuf::from("/bin/bash"), Vec::new(), false)
+            run_program(Some(rootfs), PathBuf::from("/bin/sh"), Vec::new(), false)
         }
         Command::Trace { program, args } => run_program(None, program, args, true),
     }
@@ -87,11 +87,14 @@ fn run_program(
     if let Some(record) = process_table.get(initial_pid) {
         scheduler.enqueue_process(record);
     }
+    let mut execution_caches = HashMap::new();
+    execution_caches.insert(initial_pid, ExecutionCache::default());
 
     let mut trace_records = Vec::new();
     let exit_code = run_until_exit(
         &mut process_table,
         &mut scheduler,
+        &mut execution_caches,
         initial_pid,
         trace,
         &mut trace_records,
@@ -146,6 +149,7 @@ impl Drop for TerminalResetGuard {
 fn run_until_exit(
     process_table: &mut ProcessTable,
     scheduler: &mut Scheduler,
+    execution_caches: &mut HashMap<ProcessId, ExecutionCache>,
     initial_pid: ProcessId,
     trace: bool,
     trace_records: &mut Vec<TraceRecord>,
@@ -167,18 +171,20 @@ fn run_until_exit(
             .main_thread_registers()
             .context("scheduled process has no main thread")?;
         let memory = std::mem::take(&mut record.memory);
-        let mut interpreter = Interpreter::new(memory, registers);
+        let cache = execution_caches.remove(&pid).unwrap_or_default();
+        let mut interpreter = Interpreter::with_cache(memory, registers, cache);
         interpreter.set_trace_enabled(trace);
 
-        match interpreter.step()? {
+        match interpreter.step_block()? {
             StepOutcome::Continue => {}
             StepOutcome::Halted(code) => {
                 process_table.record_exit(pid, record.parent, code);
-                let (memory, registers, trace) = interpreter.into_parts();
+                let (memory, registers, trace, cache) = interpreter.into_state();
                 record.memory = memory;
                 record.set_main_thread_registers(registers);
                 record.mark_exited(code);
                 trace_records.extend(trace);
+                execution_caches.insert(pid, cache);
                 process_table.insert_record(pid, record);
                 if pid == initial_pid {
                     initial_exit_code = Some(code);
@@ -199,17 +205,19 @@ fn run_until_exit(
                     Some(process_table),
                     Some(registers),
                 );
+                interpreter.clear_block_cache();
                 match outcome {
                     SyscallOutcome::Return(value) => {
                         interpreter.registers_mut().rax = value as u64;
                     }
                     SyscallOutcome::Exit(code) => {
                         process_table.record_exit(pid, record.parent, code);
-                        let (memory, registers, trace) = interpreter.into_parts();
+                        let (memory, registers, trace, cache) = interpreter.into_state();
                         record.memory = memory;
                         record.set_main_thread_registers(registers);
                         record.mark_exited(code);
                         trace_records.extend(trace);
+                        execution_caches.insert(pid, cache);
                         process_table.insert_record(pid, record);
                         if pid == initial_pid {
                             initial_exit_code = Some(code);
@@ -225,10 +233,11 @@ fn run_until_exit(
             }
         }
 
-        let (memory, registers, trace) = interpreter.into_parts();
+        let (memory, registers, trace, cache) = interpreter.into_state();
         record.memory = memory;
         record.set_main_thread_registers(registers);
         trace_records.extend(trace);
+        execution_caches.insert(pid, cache);
         if record.state == ProcessState::Runnable {
             sync_children(&mut record, process_table, pid);
             process_table.insert_record(pid, record);
