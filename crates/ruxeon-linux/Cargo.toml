@@ -9,4 +9,5 @@ repository.workspace = true
 ruxeon-core = { path = "../ruxeon-core" }
 ruxeon-cpu = { path = "../ruxeon-cpu" }
 ruxeon-fs = { path = "../ruxeon-fs" }
+ruxeon-host = { path = "../ruxeon-host" }
 thiserror.workspace = true

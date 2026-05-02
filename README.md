@@ -24,9 +24,10 @@ Implemented:
 - Bash-oriented syscall plumbing: pipes, fd duplication/control, polling, directory reads, time/sysinfo, uid/gid/process-group stubs, signal stubs, and `execve` reload.
 - Process model objects for PID allocation, parent/child records, wait queues, signal state, Linux threads, and cooperative scheduler queues.
 - CLI scheduler execution for runnable process snapshots created by `fork`/`clone`/`vfork`.
+- Terminal support with Linux-shaped `termios`, `TCGETS`/`TCSETS`, `TIOCGWINSZ`/`TIOCSWINSZ`, host window-size queries, raw-mode toggling, ANSI byte pass-through, and blocking stdin by default.
 - CLI commands for `run`, `trace`, and `shell` scaffolding.
 
-Later phases will deepen dynamic linker compatibility and improve terminal handling.
+Later phases will deepen dynamic linker compatibility and add performance-oriented IR execution.
 
 ## Build
 
@@ -54,6 +55,8 @@ cargo run -p ruxeon-cli -- trace ./program
 Dynamically linked ELFs are recognized through `PT_INTERP`; when `--rootfs` is provided, Ruxeon loads the requested Linux dynamic linker and transfers initial execution to it with realistic auxv metadata. Running full glibc/ld-linux workloads still requires later compatibility work in the CPU and syscall layers.
 
 `execve` reloads a new ELF into the current process and rebuilds guest memory/stack while preserving non-close-on-exec file descriptors. `fork`/`clone`/`vfork` create process-table snapshots with copied guest memory, copied registers, duplicated file descriptors, parent/child relationships, and waitable exit status. The CLI scheduler runs runnable snapshots cooperatively.
+
+Terminal ioctls are backed by a per-process terminal state and the host console where available. Guest writes pass ANSI sequences through unchanged, `TCSETS` can switch the host console into raw mode for interactive shells, and the CLI restores the host terminal mode when a guest exits.
 
 ## Fixtures
 

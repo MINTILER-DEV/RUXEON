@@ -22,5 +22,6 @@ repository = "https://github.com/ruxeon/ruxeon"
 anyhow = "1.0"
 bitflags = "2.5"
 clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.28"
 iced-x86 = "1.21"
 thiserror = "1.0"

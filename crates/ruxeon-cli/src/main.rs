@@ -60,6 +60,7 @@ fn run_program(
     args: Vec<String>,
     trace: bool,
 ) -> Result<()> {
+    let _terminal_guard = TerminalResetGuard;
     let host_program = translate_program_path(rootfs.as_ref(), &program);
     let bytes = fs::read(&host_program)
         .with_context(|| format!("failed to read {}", host_program.display()))?;
@@ -131,6 +132,14 @@ fn run_program(
         Ok(())
     } else {
         bail!("guest exited with status {exit_code}")
+    }
+}
+
+struct TerminalResetGuard;
+
+impl Drop for TerminalResetGuard {
+    fn drop(&mut self) {
+        ruxeon_host::reset_terminal_mode();
     }
 }
 

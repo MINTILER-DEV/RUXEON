@@ -16,4 +16,5 @@ ruxeon-core = { path = "../ruxeon-core" }
 ruxeon-cpu = { path = "../ruxeon-cpu" }
 ruxeon-elf = { path = "../ruxeon-elf" }
 ruxeon-fs = { path = "../ruxeon-fs" }
+ruxeon-host = { path = "../ruxeon-host" }
 ruxeon-linux = { path = "../ruxeon-linux" }

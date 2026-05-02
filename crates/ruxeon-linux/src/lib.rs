@@ -3,6 +3,7 @@
 use ruxeon_core::{GuestMemory, GuestMemoryError, MemoryPermission, PAGE_SIZE};
 use ruxeon_cpu::Registers;
 use ruxeon_fs::{FsError, GuestPath, ResolvedPath, RootFs, VirtualFile};
+use ruxeon_host::TerminalSize;
 use std::{
     collections::{HashMap, VecDeque},
     fs::{self, File, OpenOptions},
@@ -25,6 +26,7 @@ const O_RDWR: u64 = 0o2;
 const O_CREAT: u64 = 0o100;
 const O_TRUNC: u64 = 0o1000;
 const O_APPEND: u64 = 0o2000;
+const O_NONBLOCK: u64 = 0o4000;
 const O_DIRECTORY: u64 = 0o200000;
 
 const PROT_READ: u64 = 0x1;
@@ -53,8 +55,27 @@ const TIOCGWINSZ: u64 = 0x5413;
 const TIOCSWINSZ: u64 = 0x5414;
 const TCGETS: u64 = 0x5401;
 const TCSETS: u64 = 0x5402;
+const TCSETSW: u64 = 0x5403;
+const TCSETSF: u64 = 0x5404;
 const TIOCGPGRP: u64 = 0x540f;
 const TIOCSPGRP: u64 = 0x5410;
+
+const TERMIOS_SIZE: usize = 60;
+const NCCS: usize = 32;
+const BRKINT: u32 = 0x0002;
+const ICRNL: u32 = 0x0100;
+const IXON: u32 = 0x0400;
+const OPOST: u32 = 0x0001;
+const ONLCR: u32 = 0x0004;
+const B38400: u32 = 0x000f;
+const CS8: u32 = 0x0030;
+const CREAD: u32 = 0x0080;
+const ISIG: u32 = 0x0001;
+const ICANON: u32 = 0x0002;
+const ECHO: u32 = 0x0008;
+const ECHOE: u32 = 0x0010;
+const ECHOK: u32 = 0x0020;
+const IEXTEN: u32 = 0x8000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i64)]
@@ -432,7 +453,178 @@ pub struct LinuxProcess {
     mmap_next: u64,
     fs_base: u64,
     fd_table: FdTable,
+    terminal: TerminalState,
     trace: Vec<SyscallTrace>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalState {
+    termios: LinuxTermios,
+    winsize: LinuxWinsize,
+    winsize_overridden: bool,
+}
+
+impl TerminalState {
+    fn write_termios(&mut self, memory: &mut GuestMemory, addr: u64) -> Result<(), SyscallError> {
+        self.termios.write_to_memory(memory, addr)
+    }
+
+    fn read_termios(&mut self, memory: &GuestMemory, addr: u64) -> Result<(), SyscallError> {
+        self.termios = LinuxTermios::read_from_memory(memory, addr)?;
+        Ok(())
+    }
+
+    fn write_winsize(&mut self, memory: &mut GuestMemory, addr: u64) -> Result<(), SyscallError> {
+        self.current_winsize().write_to_memory(memory, addr)
+    }
+
+    fn read_winsize(&mut self, memory: &GuestMemory, addr: u64) -> Result<(), SyscallError> {
+        self.winsize = LinuxWinsize::read_from_memory(memory, addr)?;
+        self.winsize_overridden = true;
+        Ok(())
+    }
+
+    fn apply_host_mode(&self) -> Result<(), SyscallError> {
+        ruxeon_host::set_raw_mode(self.termios.raw_mode()).map_err(map_io_errno)?;
+        Ok(())
+    }
+
+    fn current_winsize(&self) -> LinuxWinsize {
+        if self.winsize_overridden {
+            return self.winsize;
+        }
+        LinuxWinsize::from_host(ruxeon_host::terminal_size())
+    }
+}
+
+impl Default for TerminalState {
+    fn default() -> Self {
+        Self {
+            termios: LinuxTermios::default(),
+            winsize: LinuxWinsize::from_host(ruxeon_host::terminal_size()),
+            winsize_overridden: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinuxTermios {
+    iflag: u32,
+    oflag: u32,
+    cflag: u32,
+    lflag: u32,
+    line: u8,
+    cc: [u8; NCCS],
+    ispeed: u32,
+    ospeed: u32,
+}
+
+impl LinuxTermios {
+    fn read_from_memory(memory: &GuestMemory, addr: u64) -> Result<Self, SyscallError> {
+        let bytes = memory.read_bytes(addr, TERMIOS_SIZE)?;
+        let mut cc = [0; NCCS];
+        cc.copy_from_slice(&bytes[17..17 + NCCS]);
+        Ok(Self {
+            iflag: u32::from_le_bytes(bytes[0..4].try_into().expect("fixed termios field")),
+            oflag: u32::from_le_bytes(bytes[4..8].try_into().expect("fixed termios field")),
+            cflag: u32::from_le_bytes(bytes[8..12].try_into().expect("fixed termios field")),
+            lflag: u32::from_le_bytes(bytes[12..16].try_into().expect("fixed termios field")),
+            line: bytes[16],
+            cc,
+            ispeed: u32::from_le_bytes(bytes[52..56].try_into().expect("fixed termios field")),
+            ospeed: u32::from_le_bytes(bytes[56..60].try_into().expect("fixed termios field")),
+        })
+    }
+
+    fn write_to_memory(&self, memory: &mut GuestMemory, addr: u64) -> Result<(), SyscallError> {
+        let mut bytes = [0; TERMIOS_SIZE];
+        bytes[0..4].copy_from_slice(&self.iflag.to_le_bytes());
+        bytes[4..8].copy_from_slice(&self.oflag.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.cflag.to_le_bytes());
+        bytes[12..16].copy_from_slice(&self.lflag.to_le_bytes());
+        bytes[16] = self.line;
+        bytes[17..17 + NCCS].copy_from_slice(&self.cc);
+        bytes[52..56].copy_from_slice(&self.ispeed.to_le_bytes());
+        bytes[56..60].copy_from_slice(&self.ospeed.to_le_bytes());
+        memory.write_bytes(addr, &bytes)?;
+        Ok(())
+    }
+
+    fn raw_mode(&self) -> bool {
+        self.lflag & ICANON == 0
+    }
+}
+
+impl Default for LinuxTermios {
+    fn default() -> Self {
+        let mut cc = [0; NCCS];
+        cc[0] = 3;
+        cc[1] = 28;
+        cc[2] = 127;
+        cc[3] = 21;
+        cc[4] = 4;
+        cc[5] = 0;
+        cc[6] = 1;
+        cc[8] = 17;
+        cc[9] = 19;
+        cc[10] = 26;
+        cc[12] = 18;
+        cc[13] = 15;
+        cc[14] = 23;
+        cc[15] = 22;
+        Self {
+            iflag: BRKINT | ICRNL | IXON,
+            oflag: OPOST | ONLCR,
+            cflag: B38400 | CS8 | CREAD,
+            lflag: ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN,
+            line: 0,
+            cc,
+            ispeed: B38400,
+            ospeed: B38400,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinuxWinsize {
+    rows: u16,
+    cols: u16,
+    xpixel: u16,
+    ypixel: u16,
+}
+
+impl LinuxWinsize {
+    fn from_host(size: Option<TerminalSize>) -> Self {
+        let size = size.unwrap_or(TerminalSize {
+            rows: 24,
+            cols: 80,
+            xpixel: 0,
+            ypixel: 0,
+        });
+        Self {
+            rows: size.rows.max(1),
+            cols: size.cols.max(1),
+            xpixel: size.xpixel,
+            ypixel: size.ypixel,
+        }
+    }
+
+    fn read_from_memory(memory: &GuestMemory, addr: u64) -> Result<Self, SyscallError> {
+        Ok(Self {
+            rows: memory.read_u16(addr)?,
+            cols: memory.read_u16(addr + 2)?,
+            xpixel: memory.read_u16(addr + 4)?,
+            ypixel: memory.read_u16(addr + 6)?,
+        })
+    }
+
+    fn write_to_memory(self, memory: &mut GuestMemory, addr: u64) -> Result<(), SyscallError> {
+        memory.write_u16(addr, self.rows)?;
+        memory.write_u16(addr + 2, self.cols)?;
+        memory.write_u16(addr + 4, self.xpixel)?;
+        memory.write_u16(addr + 6, self.ypixel)?;
+        Ok(())
+    }
 }
 
 impl LinuxProcess {
@@ -455,6 +647,7 @@ impl LinuxProcess {
             mmap_next: 0x0000_7100_0000_0000,
             fs_base: 0,
             fd_table: FdTable::new(),
+            terminal: TerminalState::default(),
             trace: Vec::new(),
         }
     }
@@ -508,6 +701,7 @@ impl LinuxProcess {
             mmap_next: self.mmap_next,
             fs_base: self.fs_base,
             fd_table: self.fd_table.duplicate_all()?,
+            terminal: self.terminal.clone(),
             trace: Vec::new(),
         })
     }
@@ -1300,10 +1494,10 @@ impl FdTable {
             return POLLNVAL;
         };
         let mut revents = 0;
-        if requested & POLLIN != 0 && slot.entry.read_ready() {
+        if requested & POLLIN != 0 && slot.read_ready() {
             revents |= POLLIN;
         }
-        if requested & POLLOUT != 0 && slot.entry.write_ready() {
+        if requested & POLLOUT != 0 && slot.write_ready() {
             revents |= POLLOUT;
         }
         revents
@@ -1319,8 +1513,14 @@ impl FdTable {
 
     pub fn read(&mut self, fd: i32, bytes: &mut [u8]) -> Result<usize, SyscallError> {
         let slot = self.entries.get_mut(&fd).ok_or(Errno::Badf)?;
+        let nonblocking = slot.status_flags & O_NONBLOCK != 0;
         match &mut slot.entry {
-            FdEntry::Stdin => io::stdin().read(bytes).map_err(map_io_errno),
+            FdEntry::Stdin => {
+                if nonblocking && !ruxeon_host::stdin_ready(Duration::ZERO).map_err(map_io_errno)? {
+                    return Err(Errno::Again.into());
+                }
+                io::stdin().read(bytes).map_err(map_io_errno)
+            }
             FdEntry::File(file) => file.read(bytes).map_err(map_io_errno),
             FdEntry::Virtual(file) => Ok(file.read(bytes)),
             FdEntry::PipeRead(buffer) => {
@@ -1454,6 +1654,32 @@ impl FdSlot {
             status_flags: self.status_flags,
         })
     }
+
+    fn read_ready(&self) -> bool {
+        match &self.entry {
+            FdEntry::Stdin if self.status_flags & O_NONBLOCK != 0 => {
+                ruxeon_host::stdin_ready(Duration::ZERO).unwrap_or(false)
+            }
+            FdEntry::Stdin | FdEntry::File(_) | FdEntry::Virtual(_) | FdEntry::Directory(_) => true,
+            FdEntry::PipeRead(buffer) | FdEntry::Buffer(buffer) => buffer
+                .lock()
+                .map(|buffer| !buffer.is_empty())
+                .unwrap_or(false),
+            FdEntry::Stdout | FdEntry::Stderr | FdEntry::PipeWrite(_) => false,
+        }
+    }
+
+    fn write_ready(&self) -> bool {
+        matches!(
+            &self.entry,
+            FdEntry::Stdout
+                | FdEntry::Stderr
+                | FdEntry::File(_)
+                | FdEntry::Virtual(_)
+                | FdEntry::PipeWrite(_)
+                | FdEntry::Buffer(_)
+        )
+    }
 }
 
 impl FdEntry {
@@ -1469,29 +1695,6 @@ impl FdEntry {
             Self::PipeWrite(buffer) => Ok(Self::PipeWrite(buffer.clone())),
             Self::Buffer(buffer) => Ok(Self::Buffer(buffer.clone())),
         }
-    }
-
-    fn read_ready(&self) -> bool {
-        match self {
-            Self::Stdin | Self::File(_) | Self::Virtual(_) | Self::Directory(_) => true,
-            Self::PipeRead(buffer) | Self::Buffer(buffer) => buffer
-                .lock()
-                .map(|buffer| !buffer.is_empty())
-                .unwrap_or(false),
-            Self::Stdout | Self::Stderr | Self::PipeWrite(_) => false,
-        }
-    }
-
-    fn write_ready(&self) -> bool {
-        matches!(
-            self,
-            Self::Stdout
-                | Self::Stderr
-                | Self::File(_)
-                | Self::Virtual(_)
-                | Self::PipeWrite(_)
-                | Self::Buffer(_)
-        )
     }
 }
 
@@ -1804,39 +2007,66 @@ impl LinuxProcess {
     }
 
     fn ioctl(
-        &self,
+        &mut self,
         memory: &mut GuestMemory,
         fd: i32,
         request: u64,
         arg: u64,
     ) -> Result<i64, SyscallError> {
-        self.fd_table.entries.get(&fd).ok_or(Errno::Badf)?;
         match request {
             TIOCGWINSZ => {
+                self.require_terminal_fd(fd)?;
                 if arg != 0 {
-                    memory.write_u16(arg, 24)?;
-                    memory.write_u16(arg + 2, 80)?;
-                    memory.write_u16(arg + 4, 0)?;
-                    memory.write_u16(arg + 6, 0)?;
+                    self.terminal.write_winsize(memory, arg)?;
                 }
                 Ok(0)
             }
-            TIOCSWINSZ => Ok(0),
+            TIOCSWINSZ => {
+                self.require_terminal_fd(fd)?;
+                if arg != 0 {
+                    self.terminal.read_winsize(memory, arg)?;
+                }
+                Ok(0)
+            }
             TCGETS => {
+                self.require_terminal_fd(fd)?;
                 if arg != 0 {
-                    memory.write_bytes(arg, &[0; 60])?;
+                    self.terminal.write_termios(memory, arg)?;
                 }
                 Ok(0)
             }
-            TCSETS => Ok(0),
+            TCSETS | TCSETSW | TCSETSF => {
+                self.require_terminal_fd(fd)?;
+                if arg != 0 {
+                    self.terminal.read_termios(memory, arg)?;
+                    self.terminal.apply_host_mode()?;
+                }
+                Ok(0)
+            }
             TIOCGPGRP => {
+                self.require_terminal_fd(fd)?;
                 if arg != 0 {
                     memory.write_u32(arg, self.pgid)?;
                 }
                 Ok(0)
             }
-            TIOCSPGRP => Ok(0),
+            TIOCSPGRP => {
+                self.require_terminal_fd(fd)?;
+                Ok(0)
+            }
             _ => Err(Errno::Inval.into()),
+        }
+    }
+
+    fn require_terminal_fd(&self, fd: i32) -> Result<(), SyscallError> {
+        let slot = self.fd_table.entries.get(&fd).ok_or(Errno::Badf)?;
+        if matches!(
+            &slot.entry,
+            FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr
+        ) {
+            Ok(())
+        } else {
+            Err(Errno::NoTty.into())
         }
     }
 }
@@ -2260,6 +2490,139 @@ mod tests {
         assert!(count > 0);
         let bytes = memory.read_bytes(0x1100, count as usize).unwrap();
         assert!(String::from_utf8(bytes).unwrap().contains("processor"));
+    }
+
+    #[test]
+    fn terminal_ioctls_round_trip_termios_and_winsize() {
+        let mut process = LinuxProcess::new(None);
+        let mut memory = memory_with_data(0x1000, &[0; 0x1000]);
+
+        assert_eq!(
+            SyscallDispatcher::dispatch(
+                &mut process,
+                &mut SyscallContext {
+                    memory: &mut memory
+                },
+                SyscallInput {
+                    number: SyscallNumber::Ioctl.raw(),
+                    args: [0, TCGETS, 0x1000, 0, 0, 0],
+                },
+            ),
+            SyscallOutcome::Return(0)
+        );
+        let lflag = memory.read_u32(0x1000 + 12).unwrap();
+        assert_ne!(lflag & ICANON, 0);
+        assert_ne!(lflag & ECHO, 0);
+
+        let mut termios = memory.read_bytes(0x1000, TERMIOS_SIZE).unwrap();
+        termios[12..16].copy_from_slice(&(lflag & !ECHO).to_le_bytes());
+        memory.write_bytes(0x1100, &termios).unwrap();
+        assert_eq!(
+            SyscallDispatcher::dispatch(
+                &mut process,
+                &mut SyscallContext {
+                    memory: &mut memory
+                },
+                SyscallInput {
+                    number: SyscallNumber::Ioctl.raw(),
+                    args: [0, TCSETS, 0x1100, 0, 0, 0],
+                },
+            ),
+            SyscallOutcome::Return(0)
+        );
+        assert_eq!(
+            SyscallDispatcher::dispatch(
+                &mut process,
+                &mut SyscallContext {
+                    memory: &mut memory
+                },
+                SyscallInput {
+                    number: SyscallNumber::Ioctl.raw(),
+                    args: [0, TCGETS, 0x1200, 0, 0, 0],
+                },
+            ),
+            SyscallOutcome::Return(0)
+        );
+        let updated_lflag = memory.read_u32(0x1200 + 12).unwrap();
+        assert_eq!(updated_lflag & ECHO, 0);
+        assert_ne!(updated_lflag & ICANON, 0);
+
+        memory.write_u16(0x1300, 40).unwrap();
+        memory.write_u16(0x1302, 120).unwrap();
+        memory.write_u16(0x1304, 1).unwrap();
+        memory.write_u16(0x1306, 2).unwrap();
+        assert_eq!(
+            SyscallDispatcher::dispatch(
+                &mut process,
+                &mut SyscallContext {
+                    memory: &mut memory
+                },
+                SyscallInput {
+                    number: SyscallNumber::Ioctl.raw(),
+                    args: [1, TIOCSWINSZ, 0x1300, 0, 0, 0],
+                },
+            ),
+            SyscallOutcome::Return(0)
+        );
+        assert_eq!(
+            SyscallDispatcher::dispatch(
+                &mut process,
+                &mut SyscallContext {
+                    memory: &mut memory
+                },
+                SyscallInput {
+                    number: SyscallNumber::Ioctl.raw(),
+                    args: [1, TIOCGWINSZ, 0x1400, 0, 0, 0],
+                },
+            ),
+            SyscallOutcome::Return(0)
+        );
+        assert_eq!(memory.read_u16(0x1400).unwrap(), 40);
+        assert_eq!(memory.read_u16(0x1402).unwrap(), 120);
+    }
+
+    #[test]
+    fn terminal_ioctl_rejects_non_terminal_fds() {
+        let mut process = LinuxProcess::new(None);
+        process
+            .fd_table_mut()
+            .install_buffer(3, Arc::new(Mutex::new(Vec::new())));
+        let mut memory = memory_with_data(0x1000, &[0; 128]);
+
+        assert_eq!(
+            SyscallDispatcher::dispatch(
+                &mut process,
+                &mut SyscallContext {
+                    memory: &mut memory
+                },
+                SyscallInput {
+                    number: SyscallNumber::Ioctl.raw(),
+                    args: [3, TCGETS, 0x1000, 0, 0, 0],
+                },
+            ),
+            SyscallOutcome::Return(Errno::NoTty.linux_return())
+        );
+    }
+
+    #[test]
+    fn terminal_ioctl_accepts_duplicated_stdio_fds() {
+        let mut process = LinuxProcess::new(None);
+        let dup_fd = process.fd_table_mut().duplicate(0, 3, false).unwrap();
+        let mut memory = memory_with_data(0x1000, &[0; 128]);
+
+        assert_eq!(
+            SyscallDispatcher::dispatch(
+                &mut process,
+                &mut SyscallContext {
+                    memory: &mut memory
+                },
+                SyscallInput {
+                    number: SyscallNumber::Ioctl.raw(),
+                    args: [dup_fd as u64, TCGETS, 0x1000, 0, 0, 0],
+                },
+            ),
+            SyscallOutcome::Return(0)
+        );
     }
 
     #[test]
