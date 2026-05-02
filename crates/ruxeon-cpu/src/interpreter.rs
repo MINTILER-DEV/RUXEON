@@ -87,6 +87,12 @@ impl Interpreter {
         &mut self.registers
     }
 
+    pub fn replace_state(&mut self, memory: GuestMemory, registers: Registers) {
+        self.memory = memory;
+        self.registers = registers;
+        self.trace.clear();
+    }
+
     pub fn set_trace_enabled(&mut self, enabled: bool) {
         self.trace_enabled = enabled;
     }

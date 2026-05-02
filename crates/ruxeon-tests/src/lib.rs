@@ -73,6 +73,7 @@ mod tests {
                             exit = Some(code);
                             break;
                         }
+                        SyscallOutcome::Execve(_) => panic!("unexpected execve"),
                     }
                 }
             }

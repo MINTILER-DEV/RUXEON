@@ -3,7 +3,9 @@ use clap::{Parser, Subcommand};
 use ruxeon_cpu::{Interpreter, Registers, StepOutcome};
 use ruxeon_elf::{ElfImage, LoadedProgram};
 use ruxeon_fs::{GuestPath, ResolvedPath, RootFs};
-use ruxeon_linux::{LinuxProcess, SyscallContext, SyscallDispatcher, SyscallInput, SyscallOutcome};
+use ruxeon_linux::{
+    ExecveRequest, LinuxProcess, SyscallContext, SyscallDispatcher, SyscallInput, SyscallOutcome,
+};
 use std::{fs, path::PathBuf};
 
 const DEFAULT_MAX_STEPS: u64 = 1_000_000;
@@ -65,8 +67,7 @@ fn run_program(
     argv.extend(args);
 
     let envp = host_environment();
-    let interpreter_bytes = load_interpreter(rootfs.as_ref(), &bytes)?;
-    let loaded = LoadedProgram::load_dynamic(bytes, interpreter_bytes, &argv, &envp)
+    let loaded = load_program_image(rootfs.as_ref(), bytes, &argv, &envp)
         .with_context(|| format!("failed to load ELF {}", host_program.display()))?;
     let registers = Registers {
         rip: loaded.entry,
@@ -132,11 +133,52 @@ fn run_until_exit(interpreter: &mut Interpreter, process: &mut LinuxProcess) -> 
                         interpreter.registers_mut().rax = value as u64;
                     }
                     SyscallOutcome::Exit(code) => return Ok(code),
+                    SyscallOutcome::Execve(request) => {
+                        execve(interpreter, process, request)?;
+                    }
                 }
             }
         }
     }
     bail!("guest exceeded step limit of {DEFAULT_MAX_STEPS}")
+}
+
+fn execve(
+    interpreter: &mut Interpreter,
+    process: &mut LinuxProcess,
+    request: ExecveRequest,
+) -> Result<()> {
+    let bytes = fs::read(&request.host_path).with_context(|| {
+        format!(
+            "failed to read execve target {}",
+            request.host_path.display()
+        )
+    })?;
+    let loaded = load_program_image(request.rootfs.as_ref(), bytes, &request.argv, &request.envp)
+        .with_context(|| {
+        format!(
+            "failed to load execve target {}",
+            request.host_path.display()
+        )
+    })?;
+    let registers = Registers {
+        rip: loaded.entry,
+        rsp: loaded.stack_pointer,
+        ..Registers::default()
+    };
+    interpreter.replace_state(loaded.memory, registers);
+    process.apply_exec(request.guest_path);
+    Ok(())
+}
+
+fn load_program_image(
+    rootfs: Option<&PathBuf>,
+    bytes: Vec<u8>,
+    argv: &[String],
+    envp: &[String],
+) -> Result<LoadedProgram> {
+    let interpreter_bytes = load_interpreter(rootfs, &bytes)?;
+    LoadedProgram::load_dynamic(bytes, interpreter_bytes, argv, envp).map_err(Into::into)
 }
 
 fn translate_program_path(rootfs: Option<&PathBuf>, program: &PathBuf) -> PathBuf {

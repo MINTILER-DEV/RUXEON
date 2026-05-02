@@ -21,9 +21,10 @@ Implemented:
 - Linux syscall dispatcher with fd table, stdio, regular file handling, errno returns, and core process syscalls.
 - Virtual Linux rootfs resolver with safe path normalization plus `/dev` and `/proc` special files.
 - PT_INTERP/PT_DYNAMIC parsing and dynamic-loader entry setup with `AT_BASE`, `AT_ENTRY`, `AT_PHDR`, and related auxv values.
+- Bash-oriented syscall plumbing: pipes, fd duplication/control, polling, directory reads, time/sysinfo, uid/gid/process-group stubs, signal stubs, and `execve` reload.
 - CLI commands for `run`, `trace`, and `shell` scaffolding.
 
-Later phases will add Linux syscall dispatch, rootfs translation, dynamic linker support, process scheduling, and terminal handling.
+Later phases will deepen dynamic linker compatibility, add a cooperative child scheduler, and improve terminal handling.
 
 ## Build
 
@@ -49,6 +50,8 @@ cargo run -p ruxeon-cli -- trace ./program
 `run` and `trace` currently execute guest syscalls through the dispatcher. Tiny static programs that use basic syscalls such as `write`, `exit`, `brk`, `mmap`, and file open/read/write paths can run within the current instruction subset.
 
 Dynamically linked ELFs are recognized through `PT_INTERP`; when `--rootfs` is provided, Ruxeon loads the requested Linux dynamic linker and transfers initial execution to it with realistic auxv metadata. Running full glibc/ld-linux workloads still requires later compatibility work in the CPU and syscall layers.
+
+`execve` reloads a new ELF into the current process and rebuilds guest memory/stack while preserving non-close-on-exec file descriptors. `fork`/`clone`/`vfork` currently return a synthetic child PID to the parent; cooperative child scheduling is reserved for the process model phase.
 
 ## Fixtures
 
