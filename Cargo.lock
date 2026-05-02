@@ -298,6 +298,7 @@ dependencies = [
  "ruxeon-fs",
  "ruxeon-host",
  "ruxeon-linux",
+ "thiserror",
 ]
 
 [[package]]

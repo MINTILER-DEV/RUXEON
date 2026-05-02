@@ -18,3 +18,4 @@ ruxeon-elf = { path = "../ruxeon-elf" }
 ruxeon-fs = { path = "../ruxeon-fs" }
 ruxeon-host = { path = "../ruxeon-host" }
 ruxeon-linux = { path = "../ruxeon-linux" }
+thiserror.workspace = true

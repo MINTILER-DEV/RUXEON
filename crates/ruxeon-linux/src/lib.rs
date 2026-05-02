@@ -86,6 +86,7 @@ pub enum Errno {
     Io = 5,
     NxIo = 6,
     Badf = 9,
+    Child = 10,
     Again = 11,
     NoMem = 12,
     Acces = 13,
@@ -127,6 +128,8 @@ impl From<Errno> for SyscallError {
 pub enum SyscallNumber {
     Read,
     Write,
+    Readv,
+    Writev,
     Open,
     Close,
     Stat,
@@ -157,6 +160,7 @@ pub enum SyscallNumber {
     Access,
     ArchPrctl,
     Getpid,
+    Sendfile,
     Getppid,
     Gettid,
     Getuid,
@@ -194,6 +198,8 @@ impl SyscallNumber {
         match self {
             Self::Read => 0,
             Self::Write => 1,
+            Self::Readv => 19,
+            Self::Writev => 20,
             Self::Open => 2,
             Self::Close => 3,
             Self::Stat => 4,
@@ -235,6 +241,7 @@ impl SyscallNumber {
             Self::ArchPrctl => 158,
             Self::Gettid => 186,
             Self::Getpid => 39,
+            Self::Sendfile => 40,
             Self::Getcwd => 79,
             Self::Chdir => 80,
             Self::Readlink => 89,
@@ -261,6 +268,8 @@ impl SyscallNumber {
         match self {
             Self::Read => "read",
             Self::Write => "write",
+            Self::Readv => "readv",
+            Self::Writev => "writev",
             Self::Open => "open",
             Self::Close => "close",
             Self::Stat => "stat",
@@ -291,6 +300,7 @@ impl SyscallNumber {
             Self::Access => "access",
             Self::ArchPrctl => "arch_prctl",
             Self::Getpid => "getpid",
+            Self::Sendfile => "sendfile",
             Self::Getppid => "getppid",
             Self::Gettid => "gettid",
             Self::Getuid => "getuid",
@@ -330,6 +340,8 @@ impl From<u64> for SyscallNumber {
         match value {
             0 => Self::Read,
             1 => Self::Write,
+            19 => Self::Readv,
+            20 => Self::Writev,
             2 => Self::Open,
             3 => Self::Close,
             4 => Self::Stat,
@@ -351,6 +363,7 @@ impl From<u64> for SyscallNumber {
             33 => Self::Dup2,
             35 => Self::Nanosleep,
             39 => Self::Getpid,
+            40 => Self::Sendfile,
             56 => Self::Clone,
             57 => Self::Fork,
             58 => Self::VFork,
@@ -403,6 +416,7 @@ pub struct SyscallInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyscallOutcome {
     Return(i64),
+    Blocked,
     Exit(i32),
     Execve(ExecveRequest),
 }
@@ -411,6 +425,7 @@ impl SyscallOutcome {
     pub fn return_value(&self) -> i64 {
         match self {
             Self::Return(value) => *value,
+            Self::Blocked => 0,
             Self::Exit(code) => *code as i64,
             Self::Execve(_) => 0,
         }
@@ -676,8 +691,16 @@ impl LinuxProcess {
         self.pgid
     }
 
+    pub fn fs_base(&self) -> u64 {
+        self.fs_base
+    }
+
     pub fn trace(&self) -> &[SyscallTrace] {
         &self.trace
+    }
+
+    pub fn executable_path(&self) -> &str {
+        &self.executable_path
     }
 
     pub fn apply_exec(&mut self, executable_path: impl Into<String>) {
@@ -947,6 +970,14 @@ impl ProcessTable {
                 .entry(parent)
                 .or_default()
                 .push(pid, status);
+            if let Some(parent_record) = self.records.get_mut(&parent) {
+                parent_record.state = ProcessState::Runnable;
+                for thread in parent_record.threads.values_mut() {
+                    if thread.state == ProcessState::Waiting {
+                        thread.state = ProcessState::Runnable;
+                    }
+                }
+            }
         }
     }
 
@@ -969,6 +1000,14 @@ impl ProcessTable {
                     .or_default()
                     .push(pid, ExitStatus { code });
             }
+            if let Some(parent_record) = self.records.get_mut(&parent) {
+                parent_record.state = ProcessState::Runnable;
+                for thread in parent_record.threads.values_mut() {
+                    if thread.state == ProcessState::Waiting {
+                        thread.state = ProcessState::Runnable;
+                    }
+                }
+            }
         }
     }
 
@@ -977,9 +1016,29 @@ impl ProcessTable {
         parent: ProcessId,
         requested: Option<ProcessId>,
     ) -> Option<(ProcessId, ExitStatus)> {
-        self.wait_queues
+        let waited = self
+            .wait_queues
             .get_mut(&parent)
-            .and_then(|queue| queue.pop_matching(requested))
+            .and_then(|queue| queue.pop_matching(requested));
+        if let Some((pid, status)) = waited {
+            self.records.remove(&pid);
+            self.wait_queues.remove(&pid);
+            if let Some(parent_record) = self.records.get_mut(&parent) {
+                parent_record.children.retain(|child| *child != pid);
+            }
+            Some((pid, status))
+        } else {
+            None
+        }
+    }
+
+    pub fn has_child(&self, parent: ProcessId, requested: Option<ProcessId>) -> bool {
+        self.records.iter().any(|(pid, record)| {
+            record.parent == Some(parent)
+                && requested
+                    .map(|requested_pid| requested_pid == *pid)
+                    .unwrap_or(true)
+        })
     }
 
     fn allocate_pid(&mut self) -> ProcessId {
@@ -1098,6 +1157,28 @@ impl SyscallDispatcher {
                 let bytes = context.memory.read_bytes(args[1], len)?;
                 process.fd_table.write(fd, &bytes)? as i64
             }
+            SyscallNumber::Writev => writev(
+                process,
+                context.memory,
+                fd_arg(args[0])?,
+                args[1],
+                usize_arg(args[2])?,
+            )?,
+            SyscallNumber::Readv => readv(
+                process,
+                context.memory,
+                fd_arg(args[0])?,
+                args[1],
+                usize_arg(args[2])?,
+            )?,
+            SyscallNumber::Sendfile => sendfile(
+                process,
+                context.memory,
+                fd_arg(args[0])?,
+                fd_arg(args[1])?,
+                args[2],
+                usize_arg(args[3])?,
+            )?,
             SyscallNumber::Open => {
                 let path = read_c_string(context.memory, args[0])?;
                 process.open_guest_path(None, &path, args[1])? as i64
@@ -1301,14 +1382,21 @@ impl SyscallDispatcher {
             SyscallNumber::Select | SyscallNumber::Pselect6 => 0,
             SyscallNumber::Wait4 => {
                 let requested = wait_requested_pid(args[0]);
+                let nohang = args[2] & 0x1 != 0;
                 if let Some(table) = process_table.as_deref_mut() {
                     if let Some((pid, status)) = table.wait4(ProcessId(process.pid), requested) {
                         if args[1] != 0 {
                             context.memory.write_u32(args[1], status.wait_status())?;
                         }
                         pid.0 as i64
+                    } else if table.has_child(ProcessId(process.pid), requested) {
+                        if nohang {
+                            0
+                        } else {
+                            return Ok(SyscallOutcome::Blocked);
+                        }
                     } else {
-                        0
+                        return Err(Errno::Child.into());
                     }
                 } else {
                     if args[1] != 0 {
@@ -2266,6 +2354,155 @@ fn poll_fds(
     Ok(ready)
 }
 
+fn writev(
+    process: &mut LinuxProcess,
+    memory: &GuestMemory,
+    fd: i32,
+    iov_addr: u64,
+    iov_count: usize,
+) -> Result<i64, SyscallError> {
+    let mut total = 0usize;
+    for index in 0..iov_count {
+        let entry = iov_addr + (index as u64 * 16);
+        let base = memory.read_u64(entry)?;
+        let len = usize_arg(memory.read_u64(entry + 8)?)?;
+        if len == 0 {
+            continue;
+        }
+        let bytes = memory.read_bytes(base, len)?;
+        total += process.fd_table.write(fd, &bytes)?;
+    }
+    Ok(total as i64)
+}
+
+fn readv(
+    process: &mut LinuxProcess,
+    memory: &mut GuestMemory,
+    fd: i32,
+    iov_addr: u64,
+    iov_count: usize,
+) -> Result<i64, SyscallError> {
+    let mut total = 0usize;
+    for index in 0..iov_count {
+        let entry = iov_addr + (index as u64 * 16);
+        let base = memory.read_u64(entry)?;
+        let len = usize_arg(memory.read_u64(entry + 8)?)?;
+        if len == 0 {
+            continue;
+        }
+        let mut bytes = vec![0; len];
+        let count = process.fd_table.read(fd, &mut bytes)?;
+        memory.write_bytes(base, &bytes[..count])?;
+        total += count;
+        if count < len {
+            break;
+        }
+    }
+    Ok(total as i64)
+}
+
+fn sendfile(
+    process: &mut LinuxProcess,
+    memory: &mut GuestMemory,
+    out_fd: i32,
+    in_fd: i32,
+    offset_addr: u64,
+    count: usize,
+) -> Result<i64, SyscallError> {
+    const CHUNK_SIZE: usize = 8192;
+
+    if count == 0 {
+        return Ok(0);
+    }
+
+    let mut requested_offset = if offset_addr == 0 {
+        None
+    } else {
+        Some(memory.read_u64(offset_addr)?)
+    };
+
+    let mut total = 0usize;
+    while total < count {
+        let chunk_len = (count - total).min(CHUNK_SIZE);
+        let mut chunk = vec![0; chunk_len];
+        let read = read_sendfile_chunk(process, in_fd, &mut requested_offset, &mut chunk)?;
+        if read == 0 {
+            break;
+        }
+
+        let mut written = 0usize;
+        while written < read {
+            let count = process.fd_table.write(out_fd, &chunk[written..read])?;
+            if count == 0 {
+                return Err(Errno::Io.into());
+            }
+            written += count;
+        }
+        total += read;
+    }
+
+    if let Some(offset) = requested_offset {
+        memory.write_u64(offset_addr, offset)?;
+    }
+
+    Ok(total as i64)
+}
+
+fn read_sendfile_chunk(
+    process: &mut LinuxProcess,
+    fd: i32,
+    offset: &mut Option<u64>,
+    chunk: &mut [u8],
+) -> Result<usize, SyscallError> {
+    let slot = process.fd_table.entries.get_mut(&fd).ok_or(Errno::Badf)?;
+    match &mut slot.entry {
+        FdEntry::File(file) => {
+            let saved_position = if let Some(offset) = *offset {
+                let current = file.stream_position().map_err(map_io_errno)?;
+                file.seek(SeekFrom::Start(offset)).map_err(map_io_errno)?;
+                Some(current)
+            } else {
+                None
+            };
+
+            let read = file.read(chunk).map_err(map_io_errno)?;
+
+            if let Some(offset_value) = offset.as_mut() {
+                *offset_value = offset_value.saturating_add(read as u64);
+            }
+            if let Some(position) = saved_position {
+                file.seek(SeekFrom::Start(position)).map_err(map_io_errno)?;
+            }
+            Ok(read)
+        }
+        FdEntry::Virtual(file) => {
+            let saved_cursor = if let Some(offset) = *offset {
+                let current = file.cursor;
+                file.cursor = offset as usize;
+                Some(current)
+            } else {
+                None
+            };
+
+            let read = file.read(chunk);
+            if let Some(offset_value) = offset.as_mut() {
+                *offset_value = offset_value.saturating_add(read as u64);
+            }
+            if let Some(cursor) = saved_cursor {
+                file.cursor = cursor;
+            }
+            Ok(read)
+        }
+        FdEntry::Directory(_) => Err(Errno::IsDir.into()),
+        FdEntry::Stdin
+        | FdEntry::Stdout
+        | FdEntry::Stderr
+        | FdEntry::PipeRead(_)
+        | FdEntry::PipeWrite(_)
+        | FdEntry::Buffer(_) => Err(Errno::Inval.into()),
+    }
+}
+
 fn wait_requested_pid(raw: u64) -> Option<ProcessId> {
     let value = raw as i64;
     if value <= 0 {
@@ -2895,6 +3132,80 @@ mod tests {
 
         assert_eq!(waited, SyscallOutcome::Return(child_pid.0 as i64));
         assert_eq!(memory.read_u32(0x1000).unwrap(), 3 << 8);
+    }
+
+    #[test]
+    fn blocking_wait4_wakes_parent_when_child_exits() {
+        let mut process = LinuxProcess::new(None);
+        let mut memory = memory_with_data(0x1000, &[0; 16]);
+        let registers = Registers {
+            rip: 0x401000,
+            rsp: 0x8000,
+            ..Registers::default()
+        };
+        let mut table = ProcessTable::new();
+        let parent_pid = table.insert_initial(LinuxProcess::new(None), memory.clone(), registers);
+        assert_eq!(parent_pid, ProcessId(process.pid()));
+
+        let forked = SyscallDispatcher::dispatch_with_process_model(
+            &mut process,
+            &mut SyscallContext {
+                memory: &mut memory,
+            },
+            SyscallInput {
+                number: SyscallNumber::Fork.raw(),
+                args: [0; 6],
+            },
+            Some(&mut table),
+            Some(registers),
+        );
+        let SyscallOutcome::Return(child_pid) = forked else {
+            panic!("expected child pid");
+        };
+        let child_pid = ProcessId(child_pid as u32);
+
+        let waiting = SyscallDispatcher::dispatch_with_process_model(
+            &mut process,
+            &mut SyscallContext {
+                memory: &mut memory,
+            },
+            SyscallInput {
+                number: SyscallNumber::Wait4.raw(),
+                args: [child_pid.0 as u64, 0x1000, 0, 0, 0, 0],
+            },
+            Some(&mut table),
+            None,
+        );
+        assert_eq!(waiting, SyscallOutcome::Blocked);
+
+        let parent_record = table.get_mut(parent_pid).unwrap();
+        parent_record.state = ProcessState::Waiting;
+        for thread in parent_record.threads.values_mut() {
+            thread.state = ProcessState::Waiting;
+        }
+
+        table.record_exit(child_pid, Some(parent_pid), 9);
+        let parent_record = table.get(parent_pid).unwrap();
+        assert_eq!(parent_record.state, ProcessState::Runnable);
+        assert!(parent_record
+            .threads
+            .values()
+            .all(|thread| thread.state == ProcessState::Runnable));
+
+        let waited = SyscallDispatcher::dispatch_with_process_model(
+            &mut process,
+            &mut SyscallContext {
+                memory: &mut memory,
+            },
+            SyscallInput {
+                number: SyscallNumber::Wait4.raw(),
+                args: [child_pid.0 as u64, 0x1000, 0, 0, 0, 0],
+            },
+            Some(&mut table),
+            None,
+        );
+        assert_eq!(waited, SyscallOutcome::Return(child_pid.0 as i64));
+        assert_eq!(memory.read_u32(0x1000).unwrap(), 9 << 8);
     }
 
     #[test]

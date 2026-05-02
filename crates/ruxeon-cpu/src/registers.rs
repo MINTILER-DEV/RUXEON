@@ -5,6 +5,7 @@ pub const FLAG_CF: u64 = 1 << 0;
 pub const FLAG_PF: u64 = 1 << 2;
 pub const FLAG_ZF: u64 = 1 << 6;
 pub const FLAG_SF: u64 = 1 << 7;
+pub const FLAG_DF: u64 = 1 << 10;
 pub const FLAG_OF: u64 = 1 << 11;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -31,6 +32,9 @@ pub struct Registers {
     pub r13: u64,
     pub r14: u64,
     pub r15: u64,
+    pub xmm: [u128; 16],
+    pub fs_base: u64,
+    pub gs_base: u64,
     pub rip: u64,
     pub rflags: u64,
 }
@@ -54,6 +58,9 @@ impl Default for Registers {
             r13: 0,
             r14: 0,
             r15: 0,
+            xmm: [0; 16],
+            fs_base: 0,
+            gs_base: 0,
             rip: 0,
             rflags: 0x2,
         }

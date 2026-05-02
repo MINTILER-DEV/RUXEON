@@ -184,11 +184,58 @@ impl GuestMemory {
         size: usize,
         permissions: MemoryPermission,
     ) -> Result<(), GuestMemoryError> {
+        if size == 0 {
+            return Ok(());
+        }
         let index = self
             .map
             .find_index(base, size)
             .ok_or(GuestMemoryError::Unmapped { addr: base, size })?;
-        self.map.regions[index].permissions = permissions;
+        let region = self.map.regions.remove(index);
+        let protect_size = u64::try_from(size).map_err(|_| GuestMemoryError::AddressOverflow {
+            base,
+            size: u64::MAX,
+        })?;
+        let protect_end =
+            base.checked_add(protect_size)
+                .ok_or(GuestMemoryError::AddressOverflow {
+                    base,
+                    size: protect_size,
+                })?;
+        let before_size = base - region.base;
+        let after_size = region.end() - protect_end;
+
+        if before_size > 0 {
+            let before_len = before_size as usize;
+            self.map.push(MemoryRegion {
+                base: region.base,
+                size: before_size,
+                permissions: region.permissions,
+                name: region.name.clone(),
+                data: region.data[..before_len].to_vec(),
+            });
+        }
+
+        let protected_offset = before_size as usize;
+        let protected_len = size;
+        self.map.push(MemoryRegion {
+            base,
+            size: protect_size,
+            permissions,
+            name: region.name.clone(),
+            data: region.data[protected_offset..protected_offset + protected_len].to_vec(),
+        });
+
+        if after_size > 0 {
+            let after_offset = protected_offset + protected_len;
+            self.map.push(MemoryRegion {
+                base: protect_end,
+                size: after_size,
+                permissions: region.permissions,
+                name: region.name,
+                data: region.data[after_offset..].to_vec(),
+            });
+        }
         Ok(())
     }
 
@@ -372,6 +419,35 @@ mod tests {
             memory.write_u8(0x1000, 1),
             Err(GuestMemoryError::Permission { .. })
         ));
+    }
+
+    #[test]
+    fn protect_splits_region_without_overprotecting_neighbors() {
+        let mut memory = GuestMemory::new();
+        memory
+            .map_region(
+                0x1000,
+                PAGE_SIZE * 3,
+                MemoryPermission::READ | MemoryPermission::WRITE,
+                Some("data".to_string()),
+            )
+            .unwrap();
+        memory.write_u8(0x1000, 1).unwrap();
+        memory.write_u8(0x2000, 2).unwrap();
+        memory.write_u8(0x3000, 3).unwrap();
+
+        memory
+            .protect(0x2000, PAGE_SIZE as usize, MemoryPermission::READ)
+            .unwrap();
+
+        assert_eq!(memory.map().regions().len(), 3);
+        memory.write_u8(0x1000, 4).unwrap();
+        memory.write_u8(0x3000, 5).unwrap();
+        assert!(matches!(
+            memory.write_u8(0x2000, 6),
+            Err(GuestMemoryError::Permission { .. })
+        ));
+        assert_eq!(memory.read_u8(0x2000).unwrap(), 2);
     }
 
     #[test]

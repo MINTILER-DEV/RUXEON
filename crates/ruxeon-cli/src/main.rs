@@ -1,16 +1,98 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use ruxeon_core::GuestMemory;
-use ruxeon_cpu::{ExecutionCache, Interpreter, Registers, StepOutcome, TraceRecord};
+use ruxeon_cpu::{
+    CpuError, ExecutionCache, Interpreter, Registers, StepOutcome, TraceRecord,
+    UnsupportedInstructionRecord,
+};
 use ruxeon_elf::{ElfImage, LoadedProgram};
 use ruxeon_fs::{GuestPath, ResolvedPath, RootFs};
 use ruxeon_linux::{
     ExecveRequest, LinuxProcess, ProcessId, ProcessRecord, ProcessState, ProcessTable, Scheduler,
-    SyscallContext, SyscallDispatcher, SyscallInput, SyscallOutcome,
+    SyscallContext, SyscallDispatcher, SyscallInput, SyscallOutcome, ThreadId,
 };
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::PathBuf,
+};
+use thiserror::Error;
 
-const DEFAULT_MAX_STEPS: u64 = 1_000_000;
+const DEFAULT_MAX_STEPS: u64 = 5_000_000;
+
+#[derive(Debug, Error)]
+enum RunError {
+    #[error("guest step failed at pid {pid} ({program}) rip {rip:#x}")]
+    GuestStep {
+        pid: u32,
+        program: String,
+        rip: u64,
+        #[source]
+        source: CpuError,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct UnsupportedInstructionEncounter {
+    pid: u32,
+    program: String,
+    record: UnsupportedInstructionRecord,
+}
+
+#[derive(Debug, Default)]
+struct UnsupportedInstructionLog {
+    seen: HashSet<String>,
+    entries: Vec<UnsupportedInstructionEncounter>,
+}
+
+impl UnsupportedInstructionLog {
+    fn record(&mut self, pid: u32, program: &str, record: UnsupportedInstructionRecord) {
+        let key = format!(
+            "{program}|{}|{}",
+            record.mnemonic,
+            format_raw_bytes(&record.raw_bytes)
+        );
+        if self.seen.insert(key) {
+            self.entries.push(UnsupportedInstructionEncounter {
+                pid,
+                program: program.to_string(),
+                record,
+            });
+        }
+    }
+
+    fn print_summary(&self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        eprintln!(
+            "unsupported instructions encountered: {}",
+            self.entries.len()
+        );
+        for entry in &self.entries {
+            eprintln!("program: {}", entry.program);
+            eprintln!("pid: {}", entry.pid);
+            eprintln!("rip: {:#x}", entry.record.ip);
+            eprintln!("bytes: {}", format_raw_bytes(&entry.record.raw_bytes));
+            eprintln!("mnemonic: {}", entry.record.mnemonic);
+            eprintln!("operands: {}", entry.record.operands.join(", "));
+            eprintln!("instruction: {}", entry.record.text);
+            eprintln!(
+                "registers: rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x} rsp={:#x} rip={:#x} rflags={:#x}",
+                entry.record.registers.rax,
+                entry.record.registers.rbx,
+                entry.record.registers.rcx,
+                entry.record.registers.rdx,
+                entry.record.registers.rsi,
+                entry.record.registers.rdi,
+                entry.record.registers.rbp,
+                entry.record.registers.rsp,
+                entry.record.registers.rip,
+                entry.record.registers.rflags
+            );
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "ruxeon", about = "Linux user-mode runtime for Windows")]
@@ -24,6 +106,8 @@ enum Command {
     Run {
         #[arg(long)]
         rootfs: Option<PathBuf>,
+        #[arg(long)]
+        trace: bool,
         program: PathBuf,
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
@@ -44,9 +128,10 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Run {
             rootfs,
+            trace,
             program,
             args,
-        } => run_program(rootfs, program, args, false),
+        } => run_program(rootfs, program, args, trace),
         Command::Shell { rootfs } => {
             run_program(Some(rootfs), PathBuf::from("/bin/sh"), Vec::new(), false)
         }
@@ -89,12 +174,14 @@ fn run_program(
     }
     let mut execution_caches = HashMap::new();
     execution_caches.insert(initial_pid, ExecutionCache::default());
+    let mut unsupported_log = UnsupportedInstructionLog::default();
 
     let mut trace_records = Vec::new();
     let exit_code = run_until_exit(
         &mut process_table,
         &mut scheduler,
         &mut execution_caches,
+        &mut unsupported_log,
         initial_pid,
         trace,
         &mut trace_records,
@@ -150,11 +237,13 @@ fn run_until_exit(
     process_table: &mut ProcessTable,
     scheduler: &mut Scheduler,
     execution_caches: &mut HashMap<ProcessId, ExecutionCache>,
+    unsupported_log: &mut UnsupportedInstructionLog,
     initial_pid: ProcessId,
     trace: bool,
     trace_records: &mut Vec<TraceRecord>,
 ) -> Result<i32> {
     let mut initial_exit_code = None;
+    let mut last_step_context: Option<(u32, String, u64)> = None;
     for _ in 0..DEFAULT_MAX_STEPS {
         let Some((pid, _tid)) = scheduler.next_thread(process_table) else {
             return initial_exit_code.context("no runnable guest processes remain");
@@ -175,7 +264,30 @@ fn run_until_exit(
         let mut interpreter = Interpreter::with_cache(memory, registers, cache);
         interpreter.set_trace_enabled(trace);
 
-        match interpreter.step_block()? {
+        let step_rip = interpreter.registers().rip;
+        last_step_context = Some((
+            pid.0,
+            record.process.executable_path().to_string(),
+            step_rip,
+        ));
+        let step = match interpreter.step_block() {
+            Ok(step) => step,
+            Err(source) => {
+                let program = record.process.executable_path().to_string();
+                if let Some(unsupported) = source.unsupported_instruction().cloned() {
+                    unsupported_log.record(pid.0, &program, unsupported);
+                    unsupported_log.print_summary();
+                }
+                return Err(RunError::GuestStep {
+                    pid: pid.0,
+                    program,
+                    rip: step_rip,
+                    source,
+                }
+                .into());
+            }
+        };
+        match step {
             StepOutcome::Continue => {}
             StepOutcome::Halted(code) => {
                 process_table.record_exit(pid, record.parent, code);
@@ -206,9 +318,27 @@ fn run_until_exit(
                     Some(registers),
                 );
                 interpreter.clear_block_cache();
+                interpreter.registers_mut().fs_base = record.process.fs_base();
                 match outcome {
                     SyscallOutcome::Return(value) => {
                         interpreter.registers_mut().rax = value as u64;
+                    }
+                    SyscallOutcome::Blocked => {
+                        let (memory, registers, trace, cache) = interpreter.into_state();
+                        record.memory = memory;
+                        record.set_main_thread_registers(registers);
+                        record.state = ProcessState::Waiting;
+                        if let Some(thread) =
+                            record.threads.get_mut(&ThreadId(record.process.tid()))
+                        {
+                            thread.state = ProcessState::Waiting;
+                        }
+                        trace_records.extend(trace);
+                        execution_caches.insert(pid, cache);
+                        sync_children(&mut record, process_table, pid);
+                        process_table.insert_record(pid, record);
+                        enqueue_runnable(process_table, scheduler);
+                        continue;
                     }
                     SyscallOutcome::Exit(code) => {
                         process_table.record_exit(pid, record.parent, code);
@@ -247,7 +377,20 @@ fn run_until_exit(
             process_table.insert_record(pid, record);
         }
     }
+    if let Some((pid, program, rip)) = last_step_context {
+        bail!(
+            "guest exceeded step limit of {DEFAULT_MAX_STEPS} at pid {pid} ({program}) rip {rip:#x}"
+        );
+    }
     bail!("guest exceeded step limit of {DEFAULT_MAX_STEPS}")
+}
+
+fn format_raw_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn enqueue_runnable(process_table: &ProcessTable, scheduler: &mut Scheduler) {
@@ -331,7 +474,20 @@ fn load_interpreter(rootfs: Option<&PathBuf>, bytes: &[u8]) -> Result<Option<Vec
 }
 
 fn host_environment() -> Vec<String> {
-    std::env::vars()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect()
+    let mut env = Vec::new();
+    let mut has_path = false;
+    for (key, value) in std::env::vars() {
+        if key.eq_ignore_ascii_case("PATH") {
+            has_path = true;
+            env.push(format!(
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            ));
+        } else {
+            env.push(format!("{key}={value}"));
+        }
+    }
+    if !has_path {
+        env.push("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string());
+    }
+    env
 }
