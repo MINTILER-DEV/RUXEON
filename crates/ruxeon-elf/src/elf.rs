@@ -5,6 +5,7 @@ pub const ELFCLASS64: u8 = 2;
 pub const ELFDATA2LSB: u8 = 1;
 pub const EM_X86_64: u16 = 62;
 pub const EV_CURRENT: u32 = 1;
+pub const ET_DYN: u16 = 3;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ElfError {
@@ -30,6 +31,10 @@ pub enum ElfError {
     SegmentOutOfBounds,
     #[error("PT_LOAD segment has memsz smaller than filesz")]
     InvalidLoadSegment,
+    #[error("dynamic section is out of bounds")]
+    DynamicOutOfBounds,
+    #[error("interpreter path is not valid UTF-8")]
+    InvalidInterpreter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +133,85 @@ pub struct ElfImage {
     bytes: Vec<u8>,
     header: ElfHeader,
     program_headers: Vec<ProgramHeader>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynamicTag {
+    Null,
+    Needed,
+    PltRelSize,
+    PltGot,
+    Hash,
+    StrTab,
+    SymTab,
+    Rela,
+    RelaSize,
+    RelaEnt,
+    StrSize,
+    SymEnt,
+    Init,
+    Fini,
+    SoName,
+    RPath,
+    Symbolic,
+    Rel,
+    RelSize,
+    RelEnt,
+    PltRel,
+    Debug,
+    TextRel,
+    JmpRel,
+    BindNow,
+    InitArray,
+    FiniArray,
+    RunPath,
+    Flags,
+    GnuHash,
+    Other(i64),
+}
+
+impl From<i64> for DynamicTag {
+    fn from(value: i64) -> Self {
+        match value {
+            0 => Self::Null,
+            1 => Self::Needed,
+            2 => Self::PltRelSize,
+            3 => Self::PltGot,
+            4 => Self::Hash,
+            5 => Self::StrTab,
+            6 => Self::SymTab,
+            7 => Self::Rela,
+            8 => Self::RelaSize,
+            9 => Self::RelaEnt,
+            10 => Self::StrSize,
+            11 => Self::SymEnt,
+            12 => Self::Init,
+            13 => Self::Fini,
+            14 => Self::SoName,
+            15 => Self::RPath,
+            16 => Self::Symbolic,
+            17 => Self::Rel,
+            18 => Self::RelSize,
+            19 => Self::RelEnt,
+            20 => Self::PltRel,
+            21 => Self::Debug,
+            22 => Self::TextRel,
+            23 => Self::JmpRel,
+            24 => Self::BindNow,
+            25 => Self::InitArray,
+            26 => Self::FiniArray,
+            29 => Self::RunPath,
+            30 => Self::Flags,
+            0x6fff_fef5 => Self::GnuHash,
+            other => Self::Other(other),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DynamicEntry {
+    pub tag: DynamicTag,
+    pub value: u64,
 }
 
 impl ElfImage {
@@ -232,6 +316,52 @@ impl ElfImage {
     pub fn entry(&self) -> u64 {
         self.header.entry
     }
+
+    pub fn is_position_independent(&self) -> bool {
+        self.header.file_type == ET_DYN
+    }
+
+    pub fn interpreter_path(&self) -> Result<Option<String>, ElfError> {
+        let Some(header) = self
+            .program_headers
+            .iter()
+            .find(|header| header.kind == ProgramHeaderType::Interp)
+        else {
+            return Ok(None);
+        };
+        let data = segment_bytes(&self.bytes, header)?;
+        let nul = data
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(data.len());
+        let path = std::str::from_utf8(&data[..nul]).map_err(|_| ElfError::InvalidInterpreter)?;
+        Ok(Some(path.to_string()))
+    }
+
+    pub fn dynamic_entries(&self) -> Result<Vec<DynamicEntry>, ElfError> {
+        let Some(header) = self
+            .program_headers
+            .iter()
+            .find(|header| header.kind == ProgramHeaderType::Dynamic)
+        else {
+            return Ok(Vec::new());
+        };
+        let data = segment_bytes(&self.bytes, header)?;
+        if data.len() % 16 != 0 {
+            return Err(ElfError::DynamicOutOfBounds);
+        }
+        let mut entries = Vec::new();
+        for chunk in data.chunks_exact(16) {
+            let tag = i64::from_le_bytes(chunk[0..8].try_into().expect("dynamic tag length"));
+            let value = u64::from_le_bytes(chunk[8..16].try_into().expect("dynamic value length"));
+            let tag = DynamicTag::from(tag);
+            entries.push(DynamicEntry { tag, value });
+            if tag == DynamicTag::Null {
+                break;
+            }
+        }
+        Ok(entries)
+    }
 }
 
 fn validate_load_segment(bytes: &[u8], header: &ProgramHeader) -> Result<(), ElfError> {
@@ -247,6 +377,15 @@ fn validate_load_segment(bytes: &[u8], header: &ProgramHeader) -> Result<(), Elf
         return Err(ElfError::SegmentOutOfBounds);
     }
     Ok(())
+}
+
+fn segment_bytes<'a>(bytes: &'a [u8], header: &ProgramHeader) -> Result<&'a [u8], ElfError> {
+    let start = usize::try_from(header.offset).map_err(|_| ElfError::SegmentOutOfBounds)?;
+    let file_size = usize::try_from(header.file_size).map_err(|_| ElfError::SegmentOutOfBounds)?;
+    let end = start
+        .checked_add(file_size)
+        .ok_or(ElfError::SegmentOutOfBounds)?;
+    bytes.get(start..end).ok_or(ElfError::SegmentOutOfBounds)
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, ElfError> {
@@ -298,7 +437,7 @@ pub(crate) fn tiny_elf_fixture() -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -321,5 +460,63 @@ mod tests {
             ElfImage::parse(bytes).unwrap_err(),
             ElfError::UnsupportedMachine(3)
         );
+    }
+
+    #[test]
+    fn parses_interp_and_dynamic_entries() {
+        let image = ElfImage::parse(dynamic_elf_fixture()).unwrap();
+
+        assert_eq!(
+            image.interpreter_path().unwrap(),
+            Some("/lib64/ld-linux-x86-64.so.2".to_string())
+        );
+        assert_eq!(image.dynamic_entries().unwrap()[0].tag, DynamicTag::Needed);
+    }
+
+    pub(crate) fn dynamic_elf_fixture() -> Vec<u8> {
+        let mut bytes = vec![0; 0x200];
+        bytes[0..4].copy_from_slice(ELF_MAGIC);
+        bytes[4] = ELFCLASS64;
+        bytes[5] = ELFDATA2LSB;
+        bytes[6] = 1;
+        bytes[16..18].copy_from_slice(&3u16.to_le_bytes());
+        bytes[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
+        bytes[20..24].copy_from_slice(&EV_CURRENT.to_le_bytes());
+        bytes[24..32].copy_from_slice(&0x180u64.to_le_bytes());
+        bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+        bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&3u16.to_le_bytes());
+
+        write_program_header(&mut bytes, 64, 1, 5, 0, 0, 0x200, 0x200);
+        write_program_header(&mut bytes, 120, 3, 4, 0x150, 0x150, 28, 28);
+        write_program_header(&mut bytes, 176, 2, 4, 0x170, 0x170, 32, 32);
+
+        bytes[0x150..0x16c].copy_from_slice(b"/lib64/ld-linux-x86-64.so.2\0");
+        bytes[0x170..0x178].copy_from_slice(&1i64.to_le_bytes());
+        bytes[0x178..0x180].copy_from_slice(&0x20u64.to_le_bytes());
+        bytes[0x180] = 0x0f;
+        bytes[0x181] = 0x05;
+        bytes
+    }
+
+    fn write_program_header(
+        bytes: &mut [u8],
+        offset: usize,
+        kind: u32,
+        flags: u32,
+        file_offset: u64,
+        virtual_address: u64,
+        file_size: u64,
+        memory_size: u64,
+    ) {
+        bytes[offset..offset + 4].copy_from_slice(&kind.to_le_bytes());
+        bytes[offset + 4..offset + 8].copy_from_slice(&flags.to_le_bytes());
+        bytes[offset + 8..offset + 16].copy_from_slice(&file_offset.to_le_bytes());
+        bytes[offset + 16..offset + 24].copy_from_slice(&virtual_address.to_le_bytes());
+        bytes[offset + 24..offset + 32].copy_from_slice(&virtual_address.to_le_bytes());
+        bytes[offset + 32..offset + 40].copy_from_slice(&file_size.to_le_bytes());
+        bytes[offset + 40..offset + 48].copy_from_slice(&memory_size.to_le_bytes());
+        bytes[offset + 48..offset + 56].copy_from_slice(&0x1000u64.to_le_bytes());
     }
 }

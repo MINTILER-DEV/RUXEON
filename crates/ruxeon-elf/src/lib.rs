@@ -2,6 +2,7 @@ mod elf;
 mod loader;
 
 pub use elf::{
-    ElfError, ElfHeader, ElfImage, ProgramHeader, ProgramHeaderFlags, ProgramHeaderType,
+    DynamicEntry, DynamicTag, ElfError, ElfHeader, ElfImage, ProgramHeader, ProgramHeaderFlags,
+    ProgramHeaderType,
 };
-pub use loader::{AuxEntry, AuxType, LoadedProgram, LoaderConfig, LoaderError};
+pub use loader::{AuxEntry, AuxType, LoadedInterpreter, LoadedProgram, LoaderConfig, LoaderError};

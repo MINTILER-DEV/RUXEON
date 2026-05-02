@@ -1,7 +1,8 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use ruxeon_cpu::{Interpreter, Registers, StepOutcome};
-use ruxeon_elf::LoadedProgram;
+use ruxeon_elf::{ElfImage, LoadedProgram};
+use ruxeon_fs::{GuestPath, ResolvedPath, RootFs};
 use ruxeon_linux::{LinuxProcess, SyscallContext, SyscallDispatcher, SyscallInput, SyscallOutcome};
 use std::{fs, path::PathBuf};
 
@@ -64,7 +65,8 @@ fn run_program(
     argv.extend(args);
 
     let envp = host_environment();
-    let loaded = LoadedProgram::load(bytes, &argv, &envp)
+    let interpreter_bytes = load_interpreter(rootfs.as_ref(), &bytes)?;
+    let loaded = LoadedProgram::load_dynamic(bytes, interpreter_bytes, &argv, &envp)
         .with_context(|| format!("failed to load ELF {}", host_program.display()))?;
     let registers = Registers {
         rip: loaded.entry,
@@ -73,7 +75,7 @@ fn run_program(
     };
     let mut interpreter = Interpreter::new(loaded.memory, registers);
     interpreter.set_trace_enabled(trace);
-    let mut process = LinuxProcess::new(rootfs);
+    let mut process = LinuxProcess::with_executable(rootfs, program.to_string_lossy().to_string());
 
     let exit_code = run_until_exit(&mut interpreter, &mut process)?;
     if trace {
@@ -142,17 +144,29 @@ fn translate_program_path(rootfs: Option<&PathBuf>, program: &PathBuf) -> PathBu
         return program.clone();
     };
 
-    let guest_path = program.to_string_lossy().replace('\\', "/");
-    if guest_path.starts_with('/') {
-        let relative = guest_path
-            .trim_start_matches('/')
-            .split('/')
-            .filter(|part| !part.is_empty() && *part != "." && *part != "..")
-            .collect::<PathBuf>();
-        rootfs.join(relative)
-    } else {
-        rootfs.join(program)
+    let rootfs = RootFs::new(rootfs);
+    match rootfs.resolve(&GuestPath::root(), &program.to_string_lossy()) {
+        Ok(ResolvedPath::Host { host, .. }) => host,
+        Ok(ResolvedPath::Virtual { .. }) | Err(_) => program.clone(),
     }
+}
+
+fn load_interpreter(rootfs: Option<&PathBuf>, bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+    let image = ElfImage::parse(bytes.to_vec())?;
+    let Some(path) = image.interpreter_path()? else {
+        return Ok(None);
+    };
+    let Some(rootfs_path) = rootfs else {
+        bail!("ELF requests interpreter {path}, but --rootfs was not provided");
+    };
+    let rootfs = RootFs::new(rootfs_path);
+    let host = match rootfs.resolve(&GuestPath::root(), &path)? {
+        ResolvedPath::Host { host, .. } => host,
+        ResolvedPath::Virtual { .. } => bail!("ELF interpreter {path} resolved to a virtual file"),
+    };
+    fs::read(&host)
+        .with_context(|| format!("failed to read ELF interpreter {}", host.display()))
+        .map(Some)
 }
 
 fn host_environment() -> Vec<String> {

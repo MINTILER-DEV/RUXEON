@@ -19,6 +19,8 @@ Implemented:
 - Guest virtual memory model.
 - x86_64 interpreter for core integer, branch, stack, and syscall instructions.
 - Linux syscall dispatcher with fd table, stdio, regular file handling, errno returns, and core process syscalls.
+- Virtual Linux rootfs resolver with safe path normalization plus `/dev` and `/proc` special files.
+- PT_INTERP/PT_DYNAMIC parsing and dynamic-loader entry setup with `AT_BASE`, `AT_ENTRY`, `AT_PHDR`, and related auxv values.
 - CLI commands for `run`, `trace`, and `shell` scaffolding.
 
 Later phases will add Linux syscall dispatch, rootfs translation, dynamic linker support, process scheduling, and terminal handling.
@@ -44,7 +46,9 @@ cargo run -p ruxeon-cli -- shell --rootfs ./rootfs
 cargo run -p ruxeon-cli -- trace ./program
 ```
 
-`run` and `trace` currently execute guest syscalls through the Phase 3 dispatcher. Tiny static programs that use basic syscalls such as `write`, `exit`, `brk`, `mmap`, and file open/read/write paths can run within the current instruction subset.
+`run` and `trace` currently execute guest syscalls through the dispatcher. Tiny static programs that use basic syscalls such as `write`, `exit`, `brk`, `mmap`, and file open/read/write paths can run within the current instruction subset.
+
+Dynamically linked ELFs are recognized through `PT_INTERP`; when `--rootfs` is provided, Ruxeon loads the requested Linux dynamic linker and transfers initial execution to it with realistic auxv metadata. Running full glibc/ld-linux workloads still requires later compatibility work in the CPU and syscall layers.
 
 ## Fixtures
 

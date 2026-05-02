@@ -1,6 +1,7 @@
 //! Linux syscall layer for the user-mode runtime.
 
 use ruxeon_core::{GuestMemory, GuestMemoryError, MemoryPermission, PAGE_SIZE};
+use ruxeon_fs::{FsError, GuestPath, ResolvedPath, RootFs, VirtualFile};
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
@@ -256,8 +257,9 @@ pub struct SyscallContext<'a> {
 pub struct LinuxProcess {
     pid: u32,
     tid: u32,
-    cwd: String,
-    rootfs: Option<PathBuf>,
+    cwd: GuestPath,
+    rootfs: Option<RootFs>,
+    executable_path: String,
     brk_base: u64,
     brk: u64,
     mmap_next: u64,
@@ -268,11 +270,16 @@ pub struct LinuxProcess {
 
 impl LinuxProcess {
     pub fn new(rootfs: Option<PathBuf>) -> Self {
+        Self::with_executable(rootfs, "/proc/self/exe")
+    }
+
+    pub fn with_executable(rootfs: Option<PathBuf>, executable_path: impl Into<String>) -> Self {
         Self {
             pid: 1000,
             tid: 1000,
-            cwd: "/".to_string(),
-            rootfs,
+            cwd: GuestPath::root(),
+            rootfs: rootfs.map(RootFs::new),
+            executable_path: executable_path.into(),
             brk_base: 0x0000_7000_0000_0000,
             brk: 0x0000_7000_0000_0000,
             mmap_next: 0x0000_7100_0000_0000,
@@ -354,8 +361,7 @@ impl SyscallDispatcher {
             }
             SyscallNumber::Stat | SyscallNumber::Lstat => {
                 let path = read_c_string(context.memory, args[0])?;
-                let host_path = process.translate_path(None, &path)?;
-                write_stat_for_path(context.memory, args[1], &host_path)?;
+                process.write_stat_for_guest_path(context.memory, None, &path, args[1])?;
                 0
             }
             SyscallNumber::Fstat => {
@@ -365,8 +371,12 @@ impl SyscallDispatcher {
             }
             SyscallNumber::Newfstatat => {
                 let path = read_c_string(context.memory, args[1])?;
-                let host_path = process.translate_path(fd_arg_allow_at_fdcwd(args[0])?, &path)?;
-                write_stat_for_path(context.memory, args[2], &host_path)?;
+                process.write_stat_for_guest_path(
+                    context.memory,
+                    fd_arg_allow_at_fdcwd(args[0])?,
+                    &path,
+                    args[2],
+                )?;
                 0
             }
             SyscallNumber::Exit | SyscallNumber::ExitGroup => {
@@ -404,7 +414,7 @@ impl SyscallDispatcher {
                 0
             }
             SyscallNumber::Getcwd => {
-                let mut bytes = process.cwd.as_bytes().to_vec();
+                let mut bytes = process.cwd.as_str().as_bytes().to_vec();
                 bytes.push(0);
                 if bytes.len() > usize_arg(args[1])? {
                     return Err(Errno::NoEnt.into());
@@ -414,33 +424,38 @@ impl SyscallDispatcher {
             }
             SyscallNumber::Chdir => {
                 let path = read_c_string(context.memory, args[0])?;
-                let (guest, host) = process.normalize_guest_path(&path)?;
+                let resolved = process.resolve_path(None, &path)?;
+                let Some(host) = resolved.host() else {
+                    return Err(Errno::NotDir.into());
+                };
                 if !host.is_dir() {
                     return Err(Errno::NoEnt.into());
                 }
-                process.cwd = guest;
+                process.cwd = resolved.guest().clone();
                 0
             }
             SyscallNumber::Access => {
                 let path = read_c_string(context.memory, args[0])?;
-                let host_path = process.translate_path(None, &path)?;
-                if host_path.exists() {
-                    0
-                } else {
-                    return Err(Errno::NoEnt.into());
+                let resolved = process.resolve_path(None, &path)?;
+                match resolved {
+                    ResolvedPath::Virtual { .. } => 0,
+                    ResolvedPath::Host { host, .. } if host.exists() => 0,
+                    ResolvedPath::Host { .. } => return Err(Errno::NoEnt.into()),
                 }
             }
             SyscallNumber::Readlink => {
                 let path = read_c_string(context.memory, args[0])?;
-                let target = if path == "/proc/self/exe" {
-                    b"/proc/self/exe".to_vec()
-                } else {
-                    let host_path = process.translate_path(None, &path)?;
-                    fs::read_link(host_path)
+                let target = match process.resolve_path(None, &path)? {
+                    ResolvedPath::Virtual {
+                        file: VirtualFile::ProcSelfExe,
+                        ..
+                    } => process.executable_path.as_bytes().to_vec(),
+                    ResolvedPath::Virtual { .. } => return Err(Errno::Inval.into()),
+                    ResolvedPath::Host { host, .. } => fs::read_link(host)
                         .map_err(map_io_errno)?
                         .to_string_lossy()
                         .as_bytes()
-                        .to_vec()
+                        .to_vec(),
                 };
                 let len = target.len().min(usize_arg(args[2])?);
                 context.memory.write_bytes(args[1], &target[..len])?;
@@ -511,6 +526,7 @@ impl FdTable {
         match entry {
             FdEntry::Stdin => io::stdin().read(bytes).map_err(map_io_errno),
             FdEntry::File(file) => file.read(bytes).map_err(map_io_errno),
+            FdEntry::Virtual(file) => Ok(file.read(bytes)),
             FdEntry::Buffer(buffer) => {
                 let mut buffer = buffer.lock().map_err(|_| Errno::Io)?;
                 let count = bytes.len().min(buffer.len());
@@ -536,6 +552,7 @@ impl FdTable {
                 Ok(bytes.len())
             }
             FdEntry::File(file) => file.write(bytes).map_err(map_io_errno),
+            FdEntry::Virtual(file) => Ok(file.write(bytes)),
             FdEntry::Buffer(buffer) => {
                 buffer
                     .lock()
@@ -552,6 +569,7 @@ impl FdTable {
         match entry {
             FdEntry::File(file) => stat_from_metadata(file.metadata().map_err(map_io_errno)?),
             FdEntry::Directory(path) => write_stat_data_for_path(path),
+            FdEntry::Virtual(file) => Ok(file.stat()),
             FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr | FdEntry::Buffer(_) => {
                 Ok(StatData::char_device())
             }
@@ -572,7 +590,64 @@ pub enum FdEntry {
     Stderr,
     File(File),
     Directory(PathBuf),
+    Virtual(VirtualFd),
     Buffer(Arc<Mutex<Vec<u8>>>),
+}
+
+#[derive(Debug)]
+pub struct VirtualFd {
+    file: VirtualFile,
+    data: Vec<u8>,
+    cursor: usize,
+}
+
+impl VirtualFd {
+    fn new(file: VirtualFile, executable_path: &str) -> Self {
+        let data = match file {
+            VirtualFile::DevNull
+            | VirtualFile::DevZero
+            | VirtualFile::DevRandom
+            | VirtualFile::DevURandom => Vec::new(),
+            _ => file.read_bytes(executable_path, usize::MAX),
+        };
+        Self {
+            file,
+            data,
+            cursor: 0,
+        }
+    }
+
+    fn read(&mut self, bytes: &mut [u8]) -> usize {
+        match self.file {
+            VirtualFile::DevNull => 0,
+            VirtualFile::DevZero | VirtualFile::DevRandom | VirtualFile::DevURandom => {
+                let data = self.file.read_bytes("", bytes.len());
+                bytes[..data.len()].copy_from_slice(&data);
+                data.len()
+            }
+            _ => {
+                let remaining = self.data.len().saturating_sub(self.cursor);
+                let count = bytes.len().min(remaining);
+                bytes[..count].copy_from_slice(&self.data[self.cursor..self.cursor + count]);
+                self.cursor += count;
+                count
+            }
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> usize {
+        self.file.write(bytes)
+    }
+
+    fn stat(&self) -> StatData {
+        match self.file {
+            VirtualFile::DevNull
+            | VirtualFile::DevZero
+            | VirtualFile::DevRandom
+            | VirtualFile::DevURandom => StatData::char_device(),
+            _ => StatData::regular(self.data.len() as u64),
+        }
+    }
 }
 
 impl LinuxProcess {
@@ -582,7 +657,19 @@ impl LinuxProcess {
         path: &str,
         flags: u64,
     ) -> Result<i32, SyscallError> {
-        let host_path = self.translate_path(dirfd, path)?;
+        let resolved = self.resolve_path(dirfd, path)?;
+        if let ResolvedPath::Virtual { file, .. } = resolved {
+            return Ok(self.fd_table.insert(FdEntry::Virtual(VirtualFd::new(
+                file,
+                &self.executable_path,
+            ))));
+        }
+        let ResolvedPath::Host {
+            host: host_path, ..
+        } = resolved
+        else {
+            unreachable!("virtual path handled above");
+        };
         if flags & O_DIRECTORY != 0 {
             if !host_path.is_dir() {
                 return Err(Errno::NotDir.into());
@@ -669,59 +756,63 @@ impl LinuxProcess {
         Ok(address)
     }
 
-    fn translate_path(&self, dirfd: Option<i32>, path: &str) -> Result<PathBuf, SyscallError> {
+    fn write_stat_for_guest_path(
+        &self,
+        memory: &mut GuestMemory,
+        dirfd: Option<i32>,
+        path: &str,
+        addr: u64,
+    ) -> Result<(), SyscallError> {
+        match self.resolve_path(dirfd, path)? {
+            ResolvedPath::Virtual { file, .. } => write_stat(
+                memory,
+                addr,
+                VirtualFd::new(file, &self.executable_path).stat(),
+            ),
+            ResolvedPath::Host { host, .. } => write_stat_for_path(memory, addr, &host),
+        }
+    }
+
+    fn resolve_path(&self, dirfd: Option<i32>, path: &str) -> Result<ResolvedPath, SyscallError> {
         if path.is_empty() {
             return Err(Errno::NoEnt.into());
         }
+        if let Some(rootfs) = &self.rootfs {
+            if path.starts_with('/') || dirfd.is_none() {
+                return rootfs.resolve(&self.cwd, path).map_err(SyscallError::from);
+            }
+        }
         if path.starts_with('/') || dirfd.is_none() {
-            let (_, host) = self.normalize_guest_path(path)?;
-            return Ok(host);
+            let guest = self.normalize_guest_path(path)?;
+            if let Some(file) = VirtualFile::from_guest_path(guest.as_str()) {
+                return Ok(ResolvedPath::Virtual { guest, file });
+            }
+            return Ok(ResolvedPath::Host {
+                host: PathBuf::from(guest.as_str()),
+                guest,
+            });
         }
         let fd = dirfd.expect("checked above");
         match self.fd_table.entries.get(&fd) {
-            Some(FdEntry::Directory(base)) => Ok(base.join(path.replace('/', "\\"))),
+            Some(FdEntry::Directory(base)) => Ok(ResolvedPath::Host {
+                guest: GuestPath::parse(path).map_err(SyscallError::from)?,
+                host: base.join(path.replace('/', "\\")),
+            }),
             _ => Err(Errno::Badf.into()),
         }
     }
 
-    fn normalize_guest_path(&self, path: &str) -> Result<(String, PathBuf), SyscallError> {
-        let mut parts = if path.starts_with('/') {
-            Vec::new()
-        } else {
-            self.cwd
-                .split('/')
-                .filter(|part| !part.is_empty())
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>()
-        };
+    fn normalize_guest_path(&self, path: &str) -> Result<GuestPath, SyscallError> {
+        self.cwd.join(path).map_err(SyscallError::from)
+    }
+}
 
-        for part in path.split('/') {
-            match part {
-                "" | "." => {}
-                ".." => {
-                    parts.pop();
-                }
-                value => {
-                    if value.contains('\0') {
-                        return Err(Errno::Inval.into());
-                    }
-                    parts.push(value.to_string());
-                }
-            }
+impl From<FsError> for SyscallError {
+    fn from(value: FsError) -> Self {
+        match value {
+            FsError::EmptyPath => Errno::NoEnt.into(),
+            FsError::WindowsPrefix | FsError::NulByte => Errno::Inval.into(),
         }
-
-        let guest = format!("/{}", parts.join("/"));
-        let host = match &self.rootfs {
-            Some(rootfs) => {
-                let mut host = rootfs.clone();
-                for part in &parts {
-                    host.push(part);
-                }
-                host
-            }
-            None => PathBuf::from(&guest),
-        };
-        Ok((guest, host))
     }
 }
 
@@ -989,5 +1080,43 @@ mod tests {
         );
 
         assert_eq!(outcome, SyscallOutcome::Return(Errno::NoSys.linux_return()));
+    }
+
+    #[test]
+    fn opens_and_reads_virtual_proc_file() {
+        let mut process = LinuxProcess::new(None);
+        let mut memory = memory_with_data(0x1000, b"/proc/cpuinfo\0");
+
+        let opened = SyscallDispatcher::dispatch(
+            &mut process,
+            &mut SyscallContext {
+                memory: &mut memory,
+            },
+            SyscallInput {
+                number: SyscallNumber::Open.raw(),
+                args: [0x1000, 0, 0, 0, 0, 0],
+            },
+        );
+        let SyscallOutcome::Return(fd) = opened else {
+            panic!("expected fd");
+        };
+        assert!(fd >= 3);
+
+        let read = SyscallDispatcher::dispatch(
+            &mut process,
+            &mut SyscallContext {
+                memory: &mut memory,
+            },
+            SyscallInput {
+                number: SyscallNumber::Read.raw(),
+                args: [fd as u64, 0x1100, 64, 0, 0, 0],
+            },
+        );
+        let SyscallOutcome::Return(count) = read else {
+            panic!("expected read count");
+        };
+        assert!(count > 0);
+        let bytes = memory.read_bytes(0x1100, count as usize).unwrap();
+        assert!(String::from_utf8(bytes).unwrap().contains("processor"));
     }
 }

@@ -169,6 +169,7 @@ dependencies = [
  "clap",
  "ruxeon-cpu",
  "ruxeon-elf",
+ "ruxeon-fs",
  "ruxeon-linux",
 ]
 
@@ -200,6 +201,9 @@ dependencies = [
 [[package]]
 name = "ruxeon-fs"
 version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "ruxeon-host"
@@ -218,6 +222,7 @@ name = "ruxeon-linux"
 version = "0.1.0"
 dependencies = [
  "ruxeon-core",
+ "ruxeon-fs",
  "thiserror",
 ]
 
