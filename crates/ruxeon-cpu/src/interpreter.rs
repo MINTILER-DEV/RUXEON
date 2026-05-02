@@ -481,6 +481,10 @@ impl Interpreter {
                 self.execute_unary(instruction, UnaryOp::Dec)?;
                 StepOutcome::Continue
             }
+            Mnemonic::Bswap => {
+                self.execute_bswap(instruction)?;
+                StepOutcome::Continue
+            }
             Mnemonic::Shl | Mnemonic::Sal => {
                 self.execute_shift(instruction, ShiftOp::Shl)?;
                 StepOutcome::Continue
@@ -724,6 +728,23 @@ impl Interpreter {
                 self.registers.set_flag(FLAG_OF, value == sign_bit(width));
                 self.set_common_flags(result, width);
                 result
+            }
+        };
+        self.write_operand(instruction, 0, result, width)?;
+        Ok(())
+    }
+
+    fn execute_bswap(&mut self, instruction: &Instruction) -> Result<(), CpuError> {
+        let width = self.destination_width(instruction, 0)?;
+        let value = self.read_operand(instruction, 0, width)? & mask(width);
+        let result = match width {
+            32 => u64::from((value as u32).swap_bytes()),
+            64 => value.swap_bytes(),
+            _ => {
+                return Err(CpuError::UnsupportedOperand {
+                    ip: instruction.ip(),
+                    instruction: format_instruction(instruction),
+                });
             }
         };
         self.write_operand(instruction, 0, result, width)?;

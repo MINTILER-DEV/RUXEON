@@ -154,6 +154,7 @@ pub enum SyscallNumber {
     Wait4,
     Kill,
     Fcntl,
+    Mkdir,
     Getdents,
     Times,
     Sysinfo,
@@ -181,6 +182,7 @@ pub enum SyscallNumber {
     Dup3,
     Pipe2,
     Openat,
+    Mkdirat,
     Newfstatat,
     RtSigaction,
     RtSigprocmask,
@@ -226,6 +228,7 @@ impl SyscallNumber {
             Self::Wait4 => 61,
             Self::Kill => 62,
             Self::Fcntl => 72,
+            Self::Mkdir => 83,
             Self::Getdents => 78,
             Self::Sysinfo => 99,
             Self::Times => 100,
@@ -249,6 +252,7 @@ impl SyscallNumber {
             Self::Getdents64 => 217,
             Self::ClockGettime => 228,
             Self::Openat => 257,
+            Self::Mkdirat => 258,
             Self::Newfstatat => 262,
             Self::Pselect6 => 270,
             Self::Ppoll => 271,
@@ -294,6 +298,7 @@ impl SyscallNumber {
             Self::Wait4 => "wait4",
             Self::Kill => "kill",
             Self::Fcntl => "fcntl",
+            Self::Mkdir => "mkdir",
             Self::Getdents => "getdents",
             Self::Times => "times",
             Self::Sysinfo => "sysinfo",
@@ -321,6 +326,7 @@ impl SyscallNumber {
             Self::Dup3 => "dup3",
             Self::Pipe2 => "pipe2",
             Self::Openat => "openat",
+            Self::Mkdirat => "mkdirat",
             Self::Newfstatat => "newfstatat",
             Self::RtSigaction => "rt_sigaction",
             Self::RtSigprocmask => "rt_sigprocmask",
@@ -373,6 +379,7 @@ impl From<u64> for SyscallNumber {
             62 => Self::Kill,
             63 => Self::Uname,
             72 => Self::Fcntl,
+            83 => Self::Mkdir,
             78 => Self::Getdents,
             79 => Self::Getcwd,
             80 => Self::Chdir,
@@ -394,6 +401,7 @@ impl From<u64> for SyscallNumber {
             228 => Self::ClockGettime,
             231 => Self::ExitGroup,
             257 => Self::Openat,
+            258 => Self::Mkdirat,
             262 => Self::Newfstatat,
             270 => Self::Pselect6,
             271 => Self::Ppoll,
@@ -1183,9 +1191,17 @@ impl SyscallDispatcher {
                 let path = read_c_string(context.memory, args[0])?;
                 process.open_guest_path(None, &path, args[1])? as i64
             }
+            SyscallNumber::Mkdir => {
+                let path = read_c_string(context.memory, args[0])?;
+                process.mkdir_guest_path(None, &path)? as i64
+            }
             SyscallNumber::Openat => {
                 let path = read_c_string(context.memory, args[1])?;
                 process.open_guest_path(fd_arg_allow_at_fdcwd(args[0])?, &path, args[2])? as i64
+            }
+            SyscallNumber::Mkdirat => {
+                let path = read_c_string(context.memory, args[1])?;
+                process.mkdir_guest_path(fd_arg_allow_at_fdcwd(args[0])?, &path)? as i64
             }
             SyscallNumber::Close => {
                 process.fd_table.close(fd_arg(args[0])?)?;
@@ -1910,6 +1926,16 @@ impl VirtualFd {
 }
 
 impl LinuxProcess {
+    fn mkdir_guest_path(&mut self, dirfd: Option<i32>, path: &str) -> Result<u32, SyscallError> {
+        match self.resolve_path(dirfd, path)? {
+            ResolvedPath::Virtual { .. } => Err(Errno::Acces.into()),
+            ResolvedPath::Host { host, .. } => {
+                fs::create_dir(&host).map_err(map_io_errno)?;
+                Ok(0)
+            }
+        }
+    }
+
     fn open_guest_path(
         &mut self,
         dirfd: Option<i32>,
@@ -2558,7 +2584,7 @@ fn map_io_errno(error: io::Error) -> SyscallError {
     match error.kind() {
         io::ErrorKind::NotFound => Errno::NoEnt.into(),
         io::ErrorKind::PermissionDenied => Errno::Acces.into(),
-        io::ErrorKind::AlreadyExists => Errno::Busy.into(),
+        io::ErrorKind::AlreadyExists => Errno::Exist.into(),
         io::ErrorKind::InvalidInput => Errno::Inval.into(),
         io::ErrorKind::WouldBlock => Errno::Again.into(),
         _ => Errno::Io.into(),
@@ -3206,6 +3232,31 @@ mod tests {
         );
         assert_eq!(waited, SyscallOutcome::Return(child_pid.0 as i64));
         assert_eq!(memory.read_u32(0x1000).unwrap(), 9 << 8);
+    }
+
+    #[test]
+    fn mkdir_creates_directory_inside_rootfs() {
+        let root = std::env::temp_dir().join(format!("ruxeon-mkdir-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let mut process = LinuxProcess::new(Some(root.clone()));
+        let mut memory = memory_with_data(0x1000, b"/demo\0");
+        let outcome = SyscallDispatcher::dispatch(
+            &mut process,
+            &mut SyscallContext {
+                memory: &mut memory,
+            },
+            SyscallInput {
+                number: SyscallNumber::Mkdir.raw(),
+                args: [0x1000, 0o755, 0, 0, 0, 0],
+            },
+        );
+
+        assert_eq!(outcome, SyscallOutcome::Return(0));
+        assert!(root.join("demo").is_dir());
+
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
