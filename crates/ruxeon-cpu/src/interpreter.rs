@@ -10,7 +10,10 @@ use ruxeon_ir::{
     BasicBlock, BasicBlockId, BlockCache, BlockCacheStats, BlockTerminator, IrInstruction,
     IrInstructionKind,
 };
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use thiserror::Error;
 
 const MAX_INSTRUCTION_LEN: usize = 15;
@@ -625,6 +628,10 @@ impl Interpreter {
                     ],
                 })
             }
+            Mnemonic::Rdtsc => {
+                self.execute_rdtsc();
+                StepOutcome::Continue
+            }
             _ => {
                 return Err(CpuError::UnsupportedInstruction {
                     record: self.unsupported_instruction_record(instruction, text)?,
@@ -749,6 +756,15 @@ impl Interpreter {
         };
         self.write_operand(instruction, 0, result, width)?;
         Ok(())
+    }
+
+    fn execute_rdtsc(&mut self) {
+        let ticks = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or(0);
+        self.registers.rax = ticks & 0xffff_ffff;
+        self.registers.rdx = ticks >> 32;
     }
 
     fn execute_mov_simd_scalar(

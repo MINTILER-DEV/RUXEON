@@ -98,13 +98,9 @@ impl RootFs {
 
                         let target = fs::read_link(&candidate_host)
                             .unwrap_or_else(|_| PathBuf::from(component));
-                        let target_text = target.to_string_lossy();
                         let parent_guest = guest_from_components(resolved.iter().cloned());
-                        let mut next_guest = if target.is_absolute() {
-                            GuestPath::parse(&target_text)?
-                        } else {
-                            parent_guest.join(&target_text)?
-                        };
+                        let mut next_guest =
+                            self.symlink_target_guest_path(&parent_guest, &target)?;
 
                         if index + 1 < components.len() {
                             let remainder = components[index + 1..].join("/");
@@ -138,6 +134,50 @@ impl RootFs {
             host.push(component);
         }
         host
+    }
+
+    fn symlink_target_guest_path(
+        &self,
+        parent_guest: &GuestPath,
+        target: &Path,
+    ) -> Result<GuestPath, FsError> {
+        let target_text = target.to_string_lossy();
+        if !has_windows_prefix(target) {
+            return if target.is_absolute() {
+                GuestPath::parse(&target_text)
+            } else {
+                parent_guest.join(&target_text)
+            };
+        }
+
+        if let Ok(relative) = target.strip_prefix(&self.host_root) {
+            return Ok(guest_from_host_relative(relative));
+        }
+
+        if let Some(parent) = self.host_root.parent() {
+            if let Ok(relative) = target.strip_prefix(parent) {
+                let relative_components = path_components(relative);
+                if let Some(root_name) = self.host_root.file_name() {
+                    if relative_components
+                        .first()
+                        .is_some_and(|component| component == &root_name)
+                    {
+                        return Ok(guest_from_components(
+                            relative_components[1..]
+                                .iter()
+                                .map(|component| component.to_string_lossy().to_string()),
+                        ));
+                    }
+                }
+                return Ok(guest_from_components(
+                    relative_components
+                        .iter()
+                        .map(|component| component.to_string_lossy().to_string()),
+                ));
+            }
+        }
+
+        Err(FsError::WindowsPrefix)
     }
 }
 
@@ -326,6 +366,28 @@ fn guest_from_components(components: impl IntoIterator<Item = String>) -> GuestP
     }
 }
 
+fn guest_from_host_relative(path: &Path) -> GuestPath {
+    guest_from_components(
+        path_components(path)
+            .iter()
+            .map(|component| component.to_string_lossy().to_string()),
+    )
+}
+
+fn path_components(path: &Path) -> Vec<&std::ffi::OsStr> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part),
+            _ => None,
+        })
+        .collect()
+}
+
+fn has_windows_prefix(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, Component::Prefix(_)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,5 +479,56 @@ mod tests {
         assert_eq!(resolved.virtual_file(), Some(VirtualFile::ProcCpuInfo));
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolves_windows_absolute_symlink_targets_as_guest_absolute_paths() {
+        let parent =
+            std::env::temp_dir().join(format!("ruxeon-fs-hostlink-parent-{}", std::process::id()));
+        let root = parent.join("debian");
+        let _ = fs::remove_dir_all(&parent);
+        create_dir_all(root.join("lib64")).unwrap();
+        create_dir_all(parent.join("lib").join("x86_64-linux-gnu")).unwrap();
+        write(
+            parent
+                .join("lib")
+                .join("x86_64-linux-gnu")
+                .join("ld-2.19.so"),
+            b"loader",
+        )
+        .unwrap();
+
+        if create_file_symlink(
+            &root.join("lib64").join("ld-linux-x86-64.so.2"),
+            &parent
+                .join("lib")
+                .join("x86_64-linux-gnu")
+                .join("ld-2.19.so"),
+        )
+        .is_err()
+        {
+            let _ = fs::remove_dir_all(&parent);
+            return;
+        }
+
+        let rootfs = RootFs::new(&root);
+        let resolved = rootfs
+            .resolve(&GuestPath::root(), "/lib64/ld-linux-x86-64.so.2")
+            .unwrap();
+
+        assert_eq!(
+            resolved.guest().as_str(),
+            "/lib/x86_64-linux-gnu/ld-2.19.so"
+        );
+        assert_eq!(
+            resolved.host().unwrap(),
+            root.join("lib")
+                .join("x86_64-linux-gnu")
+                .join("ld-2.19.so")
+                .as_path()
+        );
+
+        fs::remove_dir_all(&parent).unwrap();
     }
 }
