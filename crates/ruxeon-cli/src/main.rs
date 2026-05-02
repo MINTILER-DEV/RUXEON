@@ -116,13 +116,12 @@ fn translate_program_path(rootfs: Option<&PathBuf>, program: &PathBuf) -> PathBu
         return program.clone();
     };
 
-    if program.is_absolute() {
-        let relative = program
-            .components()
-            .filter_map(|component| match component {
-                std::path::Component::Normal(part) => Some(part),
-                _ => None,
-            })
+    let guest_path = program.to_string_lossy().replace('\\', "/");
+    if guest_path.starts_with('/') {
+        let relative = guest_path
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != "." && *part != "..")
             .collect::<PathBuf>();
         rootfs.join(relative)
     } else {
