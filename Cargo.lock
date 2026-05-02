@@ -167,6 +167,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "ruxeon-core",
  "ruxeon-cpu",
  "ruxeon-elf",
  "ruxeon-fs",

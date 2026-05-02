@@ -93,6 +93,10 @@ impl Interpreter {
         self.trace.clear();
     }
 
+    pub fn into_parts(self) -> (GuestMemory, Registers, Vec<TraceRecord>) {
+        (self.memory, self.registers, self.trace)
+    }
+
     pub fn set_trace_enabled(&mut self, enabled: bool) {
         self.trace_enabled = enabled;
     }

@@ -1,11 +1,12 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use ruxeon_cpu::{Interpreter, Registers, StepOutcome};
+use ruxeon_core::GuestMemory;
+use ruxeon_cpu::{Interpreter, Registers, StepOutcome, TraceRecord};
 use ruxeon_elf::{ElfImage, LoadedProgram};
 use ruxeon_fs::{GuestPath, ResolvedPath, RootFs};
 use ruxeon_linux::{
-    ExecveRequest, LinuxProcess, ProcessTable, Scheduler, SyscallContext, SyscallDispatcher,
-    SyscallInput, SyscallOutcome,
+    ExecveRequest, LinuxProcess, ProcessId, ProcessRecord, ProcessState, ProcessTable, Scheduler,
+    SyscallContext, SyscallDispatcher, SyscallInput, SyscallOutcome,
 };
 use std::{fs, path::PathBuf};
 
@@ -75,29 +76,27 @@ fn run_program(
         rsp: loaded.stack_pointer,
         ..Registers::default()
     };
-    let mut interpreter = Interpreter::new(loaded.memory, registers);
-    interpreter.set_trace_enabled(trace);
-    let mut process =
-        LinuxProcess::with_executable(rootfs.clone(), program.to_string_lossy().to_string());
     let mut process_table = ProcessTable::new();
     let initial_pid = process_table.insert_initial(
         LinuxProcess::with_executable(rootfs, program.to_string_lossy().to_string()),
-        interpreter.memory().clone(),
-        *interpreter.registers(),
+        loaded.memory,
+        registers,
     );
     let mut scheduler = Scheduler::new();
     if let Some(record) = process_table.get(initial_pid) {
         scheduler.enqueue_process(record);
     }
 
+    let mut trace_records = Vec::new();
     let exit_code = run_until_exit(
-        &mut interpreter,
-        &mut process,
         &mut process_table,
         &mut scheduler,
+        initial_pid,
+        trace,
+        &mut trace_records,
     )?;
     if trace {
-        for record in interpreter.trace() {
+        for record in &trace_records {
             println!(
                 "{:#018x}: {:<32} rax={:#x}->{:#x} rbx={:#x}->{:#x} rcx={:#x}->{:#x} rdx={:#x}->{:#x} rsp={:#x}->{:#x}",
                 record.ip,
@@ -114,11 +113,17 @@ fn run_program(
                 record.after.rsp
             );
         }
-        for record in process.trace() {
-            println!(
-                "syscall {:<16} #{} args={:#x?} -> {:#x}",
-                record.name, record.number, record.args, record.return_value
-            );
+        for process_record in process_table.records().values() {
+            for record in process_record.process.trace() {
+                println!(
+                    "pid {:<5} syscall {:<16} #{} args={:#x?} -> {:#x}",
+                    process_record.process.pid(),
+                    record.name,
+                    record.number,
+                    record.args,
+                    record.return_value
+                );
+            }
         }
     }
 
@@ -130,19 +135,51 @@ fn run_program(
 }
 
 fn run_until_exit(
-    interpreter: &mut Interpreter,
-    process: &mut LinuxProcess,
     process_table: &mut ProcessTable,
     scheduler: &mut Scheduler,
+    initial_pid: ProcessId,
+    trace: bool,
+    trace_records: &mut Vec<TraceRecord>,
 ) -> Result<i32> {
+    let mut initial_exit_code = None;
     for _ in 0..DEFAULT_MAX_STEPS {
+        let Some((pid, _tid)) = scheduler.next_thread(process_table) else {
+            return initial_exit_code.context("no runnable guest processes remain");
+        };
+        let Some(mut record) = process_table.take(pid) else {
+            continue;
+        };
+        if record.state != ProcessState::Runnable {
+            process_table.insert_record(pid, record);
+            continue;
+        }
+
+        let registers = record
+            .main_thread_registers()
+            .context("scheduled process has no main thread")?;
+        let memory = std::mem::take(&mut record.memory);
+        let mut interpreter = Interpreter::new(memory, registers);
+        interpreter.set_trace_enabled(trace);
+
         match interpreter.step()? {
             StepOutcome::Continue => {}
-            StepOutcome::Halted(code) => return Ok(code),
+            StepOutcome::Halted(code) => {
+                process_table.record_exit(pid, record.parent, code);
+                let (memory, registers, trace) = interpreter.into_parts();
+                record.memory = memory;
+                record.set_main_thread_registers(registers);
+                record.mark_exited(code);
+                trace_records.extend(trace);
+                process_table.insert_record(pid, record);
+                if pid == initial_pid {
+                    initial_exit_code = Some(code);
+                }
+                continue;
+            }
             StepOutcome::Syscall(trap) => {
                 let registers = *interpreter.registers();
                 let outcome = SyscallDispatcher::dispatch_with_process_model(
-                    process,
+                    &mut record.process,
                     &mut SyscallContext {
                         memory: interpreter.memory_mut(),
                     },
@@ -153,29 +190,66 @@ fn run_until_exit(
                     Some(process_table),
                     Some(registers),
                 );
-                if let Some(record) = process_table.records().values().last() {
-                    scheduler.enqueue_process(record);
-                }
                 match outcome {
                     SyscallOutcome::Return(value) => {
                         interpreter.registers_mut().rax = value as u64;
                     }
-                    SyscallOutcome::Exit(code) => return Ok(code),
+                    SyscallOutcome::Exit(code) => {
+                        process_table.record_exit(pid, record.parent, code);
+                        let (memory, registers, trace) = interpreter.into_parts();
+                        record.memory = memory;
+                        record.set_main_thread_registers(registers);
+                        record.mark_exited(code);
+                        trace_records.extend(trace);
+                        process_table.insert_record(pid, record);
+                        if pid == initial_pid {
+                            initial_exit_code = Some(code);
+                        }
+                        enqueue_runnable(process_table, scheduler);
+                        continue;
+                    }
                     SyscallOutcome::Execve(request) => {
-                        execve(interpreter, process, request)?;
+                        let (memory, registers) = execve_state(&mut record.process, request)?;
+                        interpreter.replace_state(memory, registers);
                     }
                 }
             }
+        }
+
+        let (memory, registers, trace) = interpreter.into_parts();
+        record.memory = memory;
+        record.set_main_thread_registers(registers);
+        trace_records.extend(trace);
+        if record.state == ProcessState::Runnable {
+            sync_children(&mut record, process_table, pid);
+            process_table.insert_record(pid, record);
+            enqueue_runnable(process_table, scheduler);
+        } else {
+            sync_children(&mut record, process_table, pid);
+            process_table.insert_record(pid, record);
         }
     }
     bail!("guest exceeded step limit of {DEFAULT_MAX_STEPS}")
 }
 
-fn execve(
-    interpreter: &mut Interpreter,
+fn enqueue_runnable(process_table: &ProcessTable, scheduler: &mut Scheduler) {
+    for record in process_table.records().values() {
+        scheduler.enqueue_process(record);
+    }
+}
+
+fn sync_children(record: &mut ProcessRecord, process_table: &ProcessTable, pid: ProcessId) {
+    record.children = process_table
+        .records()
+        .iter()
+        .filter_map(|(child_pid, child)| (child.parent == Some(pid)).then_some(*child_pid))
+        .collect();
+}
+
+fn execve_state(
     process: &mut LinuxProcess,
     request: ExecveRequest,
-) -> Result<()> {
+) -> Result<(GuestMemory, Registers)> {
     let bytes = fs::read(&request.host_path).with_context(|| {
         format!(
             "failed to read execve target {}",
@@ -194,9 +268,8 @@ fn execve(
         rsp: loaded.stack_pointer,
         ..Registers::default()
     };
-    interpreter.replace_state(loaded.memory, registers);
     process.apply_exec(request.guest_path);
-    Ok(())
+    Ok((loaded.memory, registers))
 }
 
 fn load_program_image(

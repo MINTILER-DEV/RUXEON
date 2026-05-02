@@ -23,9 +23,10 @@ Implemented:
 - PT_INTERP/PT_DYNAMIC parsing and dynamic-loader entry setup with `AT_BASE`, `AT_ENTRY`, `AT_PHDR`, and related auxv values.
 - Bash-oriented syscall plumbing: pipes, fd duplication/control, polling, directory reads, time/sysinfo, uid/gid/process-group stubs, signal stubs, and `execve` reload.
 - Process model objects for PID allocation, parent/child records, wait queues, signal state, Linux threads, and cooperative scheduler queues.
+- CLI scheduler execution for runnable process snapshots created by `fork`/`clone`/`vfork`.
 - CLI commands for `run`, `trace`, and `shell` scaffolding.
 
-Later phases will deepen dynamic linker compatibility, run child processes through the scheduler from the CLI, and improve terminal handling.
+Later phases will deepen dynamic linker compatibility and improve terminal handling.
 
 ## Build
 
@@ -52,7 +53,7 @@ cargo run -p ruxeon-cli -- trace ./program
 
 Dynamically linked ELFs are recognized through `PT_INTERP`; when `--rootfs` is provided, Ruxeon loads the requested Linux dynamic linker and transfers initial execution to it with realistic auxv metadata. Running full glibc/ld-linux workloads still requires later compatibility work in the CPU and syscall layers.
 
-`execve` reloads a new ELF into the current process and rebuilds guest memory/stack while preserving non-close-on-exec file descriptors. `fork`/`clone`/`vfork` can create process-table snapshots with copied guest memory, copied registers, duplicated file descriptors, parent/child relationships, and waitable exit status. The CLI keeps a process table alongside the active process; full multi-process execution through the scheduler will continue to expand as later compatibility work lands.
+`execve` reloads a new ELF into the current process and rebuilds guest memory/stack while preserving non-close-on-exec file descriptors. `fork`/`clone`/`vfork` create process-table snapshots with copied guest memory, copied registers, duplicated file descriptors, parent/child relationships, and waitable exit status. The CLI scheduler runs runnable snapshots cooperatively.
 
 ## Fixtures
 

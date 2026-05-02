@@ -580,6 +580,28 @@ pub struct ProcessRecord {
     pub signal_state: SignalState,
 }
 
+impl ProcessRecord {
+    pub fn main_thread_registers(&self) -> Option<Registers> {
+        let tid = ThreadId(self.process.tid);
+        self.threads.get(&tid).map(|thread| thread.registers)
+    }
+
+    pub fn set_main_thread_registers(&mut self, registers: Registers) {
+        let tid = ThreadId(self.process.tid);
+        if let Some(thread) = self.threads.get_mut(&tid) {
+            thread.registers = registers;
+        }
+    }
+
+    pub fn mark_exited(&mut self, code: i32) {
+        self.state = ProcessState::Exited;
+        self.exit_status = Some(ExitStatus { code });
+        for thread in self.threads.values_mut() {
+            thread.state = ProcessState::Exited;
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct WaitQueue {
     exited: VecDeque<(ProcessId, ExitStatus)>,
@@ -666,6 +688,14 @@ impl ProcessTable {
         self.records.get_mut(&pid)
     }
 
+    pub fn take(&mut self, pid: ProcessId) -> Option<ProcessRecord> {
+        self.records.remove(&pid)
+    }
+
+    pub fn insert_record(&mut self, pid: ProcessId, record: ProcessRecord) {
+        self.records.insert(pid, record);
+    }
+
     pub fn fork_from_process(
         &mut self,
         parent: &LinuxProcess,
@@ -723,6 +753,28 @@ impl ProcessTable {
                 .entry(parent)
                 .or_default()
                 .push(pid, status);
+        }
+    }
+
+    pub fn record_exit(&mut self, pid: ProcessId, parent: Option<ProcessId>, code: i32) {
+        self.exit_process(pid, code);
+        if let Some(parent) = parent {
+            let already_queued = self
+                .wait_queues
+                .get(&parent)
+                .map(|queue| {
+                    queue
+                        .exited
+                        .iter()
+                        .any(|(queued_pid, _)| *queued_pid == pid)
+                })
+                .unwrap_or(false);
+            if !already_queued {
+                self.wait_queues
+                    .entry(parent)
+                    .or_default()
+                    .push(pid, ExitStatus { code });
+            }
         }
     }
 
