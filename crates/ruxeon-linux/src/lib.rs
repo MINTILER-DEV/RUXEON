@@ -16,6 +16,7 @@ use std::{
 use thiserror::Error;
 
 const AT_FDCWD: u64 = (-100i64) as u64;
+const AT_REMOVEDIR: u64 = 0x200;
 const STAT_SIZE: usize = 144;
 const UTSNAME_FIELD_SIZE: usize = 65;
 const UTSNAME_SIZE: usize = UTSNAME_FIELD_SIZE * 6;
@@ -155,6 +156,8 @@ pub enum SyscallNumber {
     Kill,
     Fcntl,
     Mkdir,
+    Rmdir,
+    Unlink,
     Getdents,
     Times,
     Sysinfo,
@@ -183,6 +186,7 @@ pub enum SyscallNumber {
     Pipe2,
     Openat,
     Mkdirat,
+    Unlinkat,
     Newfstatat,
     RtSigaction,
     RtSigprocmask,
@@ -229,6 +233,8 @@ impl SyscallNumber {
             Self::Kill => 62,
             Self::Fcntl => 72,
             Self::Mkdir => 83,
+            Self::Rmdir => 84,
+            Self::Unlink => 87,
             Self::Getdents => 78,
             Self::Sysinfo => 99,
             Self::Times => 100,
@@ -253,6 +259,7 @@ impl SyscallNumber {
             Self::ClockGettime => 228,
             Self::Openat => 257,
             Self::Mkdirat => 258,
+            Self::Unlinkat => 263,
             Self::Newfstatat => 262,
             Self::Pselect6 => 270,
             Self::Ppoll => 271,
@@ -299,6 +306,8 @@ impl SyscallNumber {
             Self::Kill => "kill",
             Self::Fcntl => "fcntl",
             Self::Mkdir => "mkdir",
+            Self::Rmdir => "rmdir",
+            Self::Unlink => "unlink",
             Self::Getdents => "getdents",
             Self::Times => "times",
             Self::Sysinfo => "sysinfo",
@@ -327,6 +336,7 @@ impl SyscallNumber {
             Self::Pipe2 => "pipe2",
             Self::Openat => "openat",
             Self::Mkdirat => "mkdirat",
+            Self::Unlinkat => "unlinkat",
             Self::Newfstatat => "newfstatat",
             Self::RtSigaction => "rt_sigaction",
             Self::RtSigprocmask => "rt_sigprocmask",
@@ -380,6 +390,8 @@ impl From<u64> for SyscallNumber {
             63 => Self::Uname,
             72 => Self::Fcntl,
             83 => Self::Mkdir,
+            84 => Self::Rmdir,
+            87 => Self::Unlink,
             78 => Self::Getdents,
             79 => Self::Getcwd,
             80 => Self::Chdir,
@@ -402,6 +414,7 @@ impl From<u64> for SyscallNumber {
             231 => Self::ExitGroup,
             257 => Self::Openat,
             258 => Self::Mkdirat,
+            263 => Self::Unlinkat,
             262 => Self::Newfstatat,
             270 => Self::Pselect6,
             271 => Self::Ppoll,
@@ -1195,6 +1208,14 @@ impl SyscallDispatcher {
                 let path = read_c_string(context.memory, args[0])?;
                 process.mkdir_guest_path(None, &path)? as i64
             }
+            SyscallNumber::Rmdir => {
+                let path = read_c_string(context.memory, args[0])?;
+                process.remove_guest_path(None, &path, true)? as i64
+            }
+            SyscallNumber::Unlink => {
+                let path = read_c_string(context.memory, args[0])?;
+                process.remove_guest_path(None, &path, false)? as i64
+            }
             SyscallNumber::Openat => {
                 let path = read_c_string(context.memory, args[1])?;
                 process.open_guest_path(fd_arg_allow_at_fdcwd(args[0])?, &path, args[2])? as i64
@@ -1202,6 +1223,12 @@ impl SyscallDispatcher {
             SyscallNumber::Mkdirat => {
                 let path = read_c_string(context.memory, args[1])?;
                 process.mkdir_guest_path(fd_arg_allow_at_fdcwd(args[0])?, &path)? as i64
+            }
+            SyscallNumber::Unlinkat => {
+                let path = read_c_string(context.memory, args[1])?;
+                let remove_dir = args[2] & AT_REMOVEDIR != 0;
+                process.remove_guest_path(fd_arg_allow_at_fdcwd(args[0])?, &path, remove_dir)?
+                    as i64
             }
             SyscallNumber::Close => {
                 process.fd_table.close(fd_arg(args[0])?)?;
@@ -1931,6 +1958,25 @@ impl LinuxProcess {
             ResolvedPath::Virtual { .. } => Err(Errno::Acces.into()),
             ResolvedPath::Host { host, .. } => {
                 fs::create_dir(&host).map_err(map_io_errno)?;
+                Ok(0)
+            }
+        }
+    }
+
+    fn remove_guest_path(
+        &mut self,
+        dirfd: Option<i32>,
+        path: &str,
+        remove_dir: bool,
+    ) -> Result<u32, SyscallError> {
+        match self.resolve_path(dirfd, path)? {
+            ResolvedPath::Virtual { .. } => Err(Errno::Acces.into()),
+            ResolvedPath::Host { host, .. } => {
+                if remove_dir {
+                    fs::remove_dir(&host).map_err(map_io_errno)?;
+                } else {
+                    fs::remove_file(&host).map_err(map_io_errno)?;
+                }
                 Ok(0)
             }
         }
@@ -3255,6 +3301,57 @@ mod tests {
 
         assert_eq!(outcome, SyscallOutcome::Return(0));
         assert!(root.join("demo").is_dir());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn unlink_removes_file_inside_rootfs() {
+        let root = std::env::temp_dir().join(format!("ruxeon-unlink-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("demo.txt"), b"hello").unwrap();
+
+        let mut process = LinuxProcess::new(Some(root.clone()));
+        let mut memory = memory_with_data(0x1000, b"/demo.txt\0");
+        let outcome = SyscallDispatcher::dispatch(
+            &mut process,
+            &mut SyscallContext {
+                memory: &mut memory,
+            },
+            SyscallInput {
+                number: SyscallNumber::Unlink.raw(),
+                args: [0x1000, 0, 0, 0, 0, 0],
+            },
+        );
+
+        assert_eq!(outcome, SyscallOutcome::Return(0));
+        assert!(!root.join("demo.txt").exists());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn rmdir_removes_directory_inside_rootfs() {
+        let root = std::env::temp_dir().join(format!("ruxeon-rmdir-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("demo")).unwrap();
+
+        let mut process = LinuxProcess::new(Some(root.clone()));
+        let mut memory = memory_with_data(0x1000, b"/demo\0");
+        let outcome = SyscallDispatcher::dispatch(
+            &mut process,
+            &mut SyscallContext {
+                memory: &mut memory,
+            },
+            SyscallInput {
+                number: SyscallNumber::Rmdir.raw(),
+                args: [0x1000, 0, 0, 0, 0, 0],
+            },
+        );
+
+        assert_eq!(outcome, SyscallOutcome::Return(0));
+        assert!(!root.join("demo").exists());
 
         fs::remove_dir_all(&root).unwrap();
     }
