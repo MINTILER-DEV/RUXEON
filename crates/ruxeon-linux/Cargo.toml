@@ -6,4 +6,5 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+ruxeon-core = { path = "../ruxeon-core" }
 thiserror.workspace = true

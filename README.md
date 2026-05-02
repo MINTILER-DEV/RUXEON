@@ -18,6 +18,7 @@ Implemented:
 - Linux-style initial stack setup with `argv`, `envp`, and auxv.
 - Guest virtual memory model.
 - x86_64 interpreter for core integer, branch, stack, and syscall instructions.
+- Linux syscall dispatcher with fd table, stdio, regular file handling, errno returns, and core process syscalls.
 - CLI commands for `run`, `trace`, and `shell` scaffolding.
 
 Later phases will add Linux syscall dispatch, rootfs translation, dynamic linker support, process scheduling, and terminal handling.
@@ -43,7 +44,7 @@ cargo run -p ruxeon-cli -- shell --rootfs ./rootfs
 cargo run -p ruxeon-cli -- trace ./program
 ```
 
-`run` and `trace` currently execute until the guest exits with Linux syscall `exit`/`exit_group`, reaches an unsupported syscall, or hits the step limit.
+`run` and `trace` currently execute guest syscalls through the Phase 3 dispatcher. Tiny static programs that use basic syscalls such as `write`, `exit`, `brk`, `mmap`, and file open/read/write paths can run within the current instruction subset.
 
 ## Fixtures
 

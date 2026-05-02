@@ -1,7 +1,8 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use ruxeon_cpu::{Interpreter, Registers, RunOutcome};
+use ruxeon_cpu::{Interpreter, Registers, StepOutcome};
 use ruxeon_elf::LoadedProgram;
+use ruxeon_linux::{LinuxProcess, SyscallContext, SyscallDispatcher, SyscallInput, SyscallOutcome};
 use std::{fs, path::PathBuf};
 
 const DEFAULT_MAX_STEPS: u64 = 1_000_000;
@@ -72,8 +73,9 @@ fn run_program(
     };
     let mut interpreter = Interpreter::new(loaded.memory, registers);
     interpreter.set_trace_enabled(trace);
+    let mut process = LinuxProcess::new(rootfs);
 
-    let outcome = interpreter.run(DEFAULT_MAX_STEPS)?;
+    let exit_code = run_until_exit(&mut interpreter, &mut process)?;
     if trace {
         for record in interpreter.trace() {
             println!(
@@ -92,23 +94,47 @@ fn run_program(
                 record.after.rsp
             );
         }
+        for record in process.trace() {
+            println!(
+                "syscall {:<16} #{} args={:#x?} -> {:#x}",
+                record.name, record.number, record.args, record.return_value
+            );
+        }
     }
 
-    match outcome {
-        RunOutcome::Exited(code) => {
-            if code == 0 {
-                Ok(())
-            } else {
-                bail!("guest exited with status {code}")
+    if exit_code == 0 {
+        Ok(())
+    } else {
+        bail!("guest exited with status {exit_code}")
+    }
+}
+
+fn run_until_exit(interpreter: &mut Interpreter, process: &mut LinuxProcess) -> Result<i32> {
+    for _ in 0..DEFAULT_MAX_STEPS {
+        match interpreter.step()? {
+            StepOutcome::Continue => {}
+            StepOutcome::Halted(code) => return Ok(code),
+            StepOutcome::Syscall(trap) => {
+                let outcome = SyscallDispatcher::dispatch(
+                    process,
+                    &mut SyscallContext {
+                        memory: interpreter.memory_mut(),
+                    },
+                    SyscallInput {
+                        number: trap.number,
+                        args: trap.args,
+                    },
+                );
+                match outcome {
+                    SyscallOutcome::Return(value) => {
+                        interpreter.registers_mut().rax = value as u64;
+                    }
+                    SyscallOutcome::Exit(code) => return Ok(code),
+                }
             }
         }
-        RunOutcome::Syscall(trap) => bail!(
-            "unsupported Linux syscall {} args={:#x?}",
-            trap.number,
-            trap.args
-        ),
-        RunOutcome::StepLimit => bail!("guest exceeded step limit of {DEFAULT_MAX_STEPS}"),
     }
+    bail!("guest exceeded step limit of {DEFAULT_MAX_STEPS}")
 }
 
 fn translate_program_path(rootfs: Option<&PathBuf>, program: &PathBuf) -> PathBuf {

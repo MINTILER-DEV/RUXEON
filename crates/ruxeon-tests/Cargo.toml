@@ -9,3 +9,4 @@ repository.workspace = true
 ruxeon-core = { path = "../ruxeon-core" }
 ruxeon-cpu = { path = "../ruxeon-cpu" }
 ruxeon-elf = { path = "../ruxeon-elf" }
+ruxeon-linux = { path = "../ruxeon-linux" }

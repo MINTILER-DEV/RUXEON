@@ -192,6 +192,23 @@ impl GuestMemory {
         Ok(())
     }
 
+    pub fn unmap_region(&mut self, base: u64, size: u64) -> Result<(), GuestMemoryError> {
+        if size == 0 {
+            return Err(GuestMemoryError::EmptyMapping);
+        }
+        let index = self
+            .map
+            .regions
+            .iter()
+            .position(|region| region.base == base && region.size == size)
+            .ok_or(GuestMemoryError::Unmapped {
+                addr: base,
+                size: usize::try_from(size).unwrap_or(usize::MAX),
+            })?;
+        self.map.regions.remove(index);
+        Ok(())
+    }
+
     pub fn permissions_at(&self, addr: u64) -> Option<MemoryPermission> {
         self.map
             .regions
@@ -354,6 +371,21 @@ mod tests {
         assert!(matches!(
             memory.write_u8(0x1000, 1),
             Err(GuestMemoryError::Permission { .. })
+        ));
+    }
+
+    #[test]
+    fn unmaps_exact_region() {
+        let mut memory = GuestMemory::new();
+        memory
+            .map_region(0x1000, PAGE_SIZE, MemoryPermission::READ, None)
+            .unwrap();
+
+        memory.unmap_region(0x1000, PAGE_SIZE).unwrap();
+
+        assert!(matches!(
+            memory.read_u8(0x1000),
+            Err(GuestMemoryError::Unmapped { .. })
         ));
     }
 }

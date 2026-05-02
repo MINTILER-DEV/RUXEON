@@ -14,3 +14,4 @@ anyhow.workspace = true
 clap.workspace = true
 ruxeon-cpu = { path = "../ruxeon-cpu" }
 ruxeon-elf = { path = "../ruxeon-elf" }
+ruxeon-linux = { path = "../ruxeon-linux" }

@@ -374,13 +374,14 @@ impl Interpreter {
     }
 
     fn effective_address(&self, instruction: &Instruction) -> Result<u64, CpuError> {
+        if instruction.is_ip_rel_memory_operand() {
+            return Ok(instruction.ip_rel_memory_address());
+        }
+
         let mut address = instruction.memory_displacement64();
         let base = instruction.memory_base();
         if base != Register::None {
-            let base_value = match base {
-                Register::RIP | Register::EIP => instruction.next_ip(),
-                _ => self.registers.read(base)?,
-            };
+            let base_value = self.registers.read(base)?;
             address = address.wrapping_add(base_value);
         }
 
