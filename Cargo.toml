@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ruxeon-cli",
+    "crates/ruxeon-core",
+    "crates/ruxeon-cpu",
+    "crates/ruxeon-elf",
+    "crates/ruxeon-fs",
+    "crates/ruxeon-host",
+    "crates/ruxeon-ir",
+    "crates/ruxeon-ldso",
+    "crates/ruxeon-linux",
+    "crates/ruxeon-tests",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ruxeon/ruxeon"
+
+[workspace.dependencies]
+anyhow = "1.0"
+bitflags = "2.5"
+clap = { version = "4.5", features = ["derive"] }
+iced-x86 = "1.21"
+thiserror = "1.0"

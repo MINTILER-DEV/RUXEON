@@ -1,0 +1,16 @@
+[package]
+name = "ruxeon-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ruxeon"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+ruxeon-cpu = { path = "../ruxeon-cpu" }
+ruxeon-elf = { path = "../ruxeon-elf" }

@@ -1,0 +1,11 @@
+[package]
+name = "ruxeon-tests"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ruxeon-core = { path = "../ruxeon-core" }
+ruxeon-cpu = { path = "../ruxeon-cpu" }
+ruxeon-elf = { path = "../ruxeon-elf" }
