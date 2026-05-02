@@ -100,6 +100,7 @@ pub enum Errno {
     MFile = 24,
     NoTty = 25,
     Pipe = 32,
+    Loop = 40,
     NoSys = 38,
     NoData = 61,
     NamTooLong = 36,
@@ -2236,6 +2237,7 @@ impl From<FsError> for SyscallError {
         match value {
             FsError::EmptyPath => Errno::NoEnt.into(),
             FsError::WindowsPrefix | FsError::NulByte => Errno::Inval.into(),
+            FsError::TooManySymlinks => Errno::Loop.into(),
         }
     }
 }

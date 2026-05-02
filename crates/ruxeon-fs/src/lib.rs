@@ -1,10 +1,13 @@
 //! Virtual Linux filesystem and rootfs path resolver.
 
 use std::{
+    fs,
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
+
+const MAX_SYMLINK_EXPANSIONS: usize = 40;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum FsError {
@@ -14,6 +17,8 @@ pub enum FsError {
     WindowsPrefix,
     #[error("guest path contains a NUL byte")]
     NulByte,
+    #[error("guest path contains too many symlink expansions")]
+    TooManySymlinks,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +38,7 @@ impl RootFs {
     }
 
     pub fn resolve(&self, cwd: &GuestPath, path: &str) -> Result<ResolvedPath, FsError> {
-        let guest = cwd.join(path)?;
+        let guest = self.resolve_guest_path(cwd, path)?;
         if let Some(virtual_file) = VirtualFile::from_guest_path(guest.as_str()) {
             return Ok(ResolvedPath::Virtual {
                 guest,
@@ -63,6 +68,76 @@ impl RootFs {
                 Ok((guest, host))
             }
         }
+    }
+
+    fn resolve_guest_path(&self, cwd: &GuestPath, path: &str) -> Result<GuestPath, FsError> {
+        let mut guest = cwd.join(path)?;
+        let mut expansions = 0usize;
+
+        loop {
+            let components = guest.components().map(str::to_string).collect::<Vec<_>>();
+            let mut resolved = Vec::with_capacity(components.len());
+            let mut changed = false;
+            let mut index = 0usize;
+
+            while index < components.len() {
+                let component = &components[index];
+                let candidate_guest = guest_from_components(
+                    resolved
+                        .iter()
+                        .cloned()
+                        .chain(std::iter::once(component.clone())),
+                );
+                let candidate_host = self.host_path(&candidate_guest);
+                match fs::symlink_metadata(&candidate_host) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        expansions += 1;
+                        if expansions > MAX_SYMLINK_EXPANSIONS {
+                            return Err(FsError::TooManySymlinks);
+                        }
+
+                        let target = fs::read_link(&candidate_host)
+                            .unwrap_or_else(|_| PathBuf::from(component));
+                        let target_text = target.to_string_lossy();
+                        let parent_guest = guest_from_components(resolved.iter().cloned());
+                        let mut next_guest = if target.is_absolute() {
+                            GuestPath::parse(&target_text)?
+                        } else {
+                            parent_guest.join(&target_text)?
+                        };
+
+                        if index + 1 < components.len() {
+                            let remainder = components[index + 1..].join("/");
+                            next_guest = next_guest.join(&remainder)?;
+                        }
+
+                        guest = next_guest;
+                        changed = true;
+                        break;
+                    }
+                    Ok(_) => resolved.push(component.clone()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        resolved.extend(components[index..].iter().cloned());
+                        index = components.len() - 1;
+                    }
+                    Err(_) => resolved.push(component.clone()),
+                }
+
+                index += 1;
+            }
+
+            if !changed {
+                return Ok(guest_from_components(resolved));
+            }
+        }
+    }
+
+    fn host_path(&self, guest: &GuestPath) -> PathBuf {
+        let mut host = self.host_root.clone();
+        for component in guest.components() {
+            host.push(component);
+        }
+        host
     }
 }
 
@@ -240,9 +315,31 @@ fn deterministic_random(len: usize) -> Vec<u8> {
     bytes
 }
 
+fn guest_from_components(components: impl IntoIterator<Item = String>) -> GuestPath {
+    let parts = components.into_iter().collect::<Vec<_>>();
+    if parts.is_empty() {
+        GuestPath::root()
+    } else {
+        GuestPath {
+            raw: format!("/{}", parts.join("/")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{create_dir_all, write};
+
+    #[cfg(windows)]
+    fn create_file_symlink(link: &Path, target: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
+    #[cfg(unix)]
+    fn create_file_symlink(link: &Path, target: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
 
     #[test]
     fn normalizes_guest_paths_without_escaping_root() {
@@ -269,5 +366,56 @@ mod tests {
             GuestPath::parse("C:/Windows").unwrap_err(),
             FsError::WindowsPrefix
         );
+    }
+
+    #[test]
+    fn resolves_relative_symlink_targets_inside_rootfs() {
+        let root = std::env::temp_dir().join(format!("ruxeon-fs-symlink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        create_dir_all(root.join("lib")).unwrap();
+        create_dir_all(root.join("lib64")).unwrap();
+        write(root.join("lib").join("ld-musl-x86_64.so.1"), b"loader").unwrap();
+
+        if create_file_symlink(
+            &root.join("lib64").join("ld-linux-x86-64.so.2"),
+            Path::new("../lib/ld-musl-x86_64.so.1"),
+        )
+        .is_err()
+        {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+
+        let rootfs = RootFs::new(&root);
+        let resolved = rootfs
+            .resolve(&GuestPath::root(), "/lib64/ld-linux-x86-64.so.2")
+            .unwrap();
+
+        assert_eq!(resolved.guest().as_str(), "/lib/ld-musl-x86_64.so.1");
+        assert_eq!(
+            resolved.host().unwrap(),
+            root.join("lib").join("ld-musl-x86_64.so.1").as_path()
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn resolves_symlink_targets_into_virtual_files() {
+        let root =
+            std::env::temp_dir().join(format!("ruxeon-fs-virtual-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        create_dir_all(&root).unwrap();
+
+        if create_file_symlink(&root.join("cpuinfo-link"), Path::new("/proc/cpuinfo")).is_err() {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+
+        let rootfs = RootFs::new(&root);
+        let resolved = rootfs.resolve(&GuestPath::root(), "/cpuinfo-link").unwrap();
+        assert_eq!(resolved.virtual_file(), Some(VirtualFile::ProcCpuInfo));
+
+        fs::remove_dir_all(&root).unwrap();
     }
 }
