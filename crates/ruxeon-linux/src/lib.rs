@@ -7,6 +7,7 @@ use ruxeon_host::TerminalSize;
 use std::{
     collections::{HashMap, VecDeque},
     fs::{self, File, OpenOptions},
+    hash::{DefaultHasher, Hash, Hasher},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -33,6 +34,10 @@ const O_DIRECTORY: u64 = 0o200000;
 const PROT_READ: u64 = 0x1;
 const PROT_WRITE: u64 = 0x2;
 const PROT_EXEC: u64 = 0x4;
+
+const MAP_PRIVATE: u64 = 0x02;
+const MAP_FIXED: u64 = 0x10;
+const MAP_ANONYMOUS: u64 = 0x20;
 
 const ARCH_SET_FS: u64 = 0x1002;
 const ARCH_GET_FS: u64 = 0x1003;
@@ -61,8 +66,8 @@ const TCSETSF: u64 = 0x5404;
 const TIOCGPGRP: u64 = 0x540f;
 const TIOCSPGRP: u64 = 0x5410;
 
-const TERMIOS_SIZE: usize = 60;
-const NCCS: usize = 32;
+const TERMIOS_SIZE: usize = 36;
+const NCCS: usize = 19;
 const BRKINT: u32 = 0x0002;
 const ICRNL: u32 = 0x0100;
 const IXON: u32 = 0x0400;
@@ -77,6 +82,7 @@ const ECHO: u32 = 0x0008;
 const ECHOE: u32 = 0x0010;
 const ECHOK: u32 = 0x0020;
 const IEXTEN: u32 = 0x8000;
+const GLIBC_PTHREAD_TID_OFFSET: u64 = 0x2d0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i64)]
@@ -489,6 +495,7 @@ pub struct LinuxProcess {
     brk: u64,
     mmap_next: u64,
     fs_base: u64,
+    set_tid_address: u64,
     fd_table: FdTable,
     terminal: TerminalState,
     trace: Vec<SyscallTrace>,
@@ -552,8 +559,6 @@ struct LinuxTermios {
     lflag: u32,
     line: u8,
     cc: [u8; NCCS],
-    ispeed: u32,
-    ospeed: u32,
 }
 
 impl LinuxTermios {
@@ -568,8 +573,6 @@ impl LinuxTermios {
             lflag: u32::from_le_bytes(bytes[12..16].try_into().expect("fixed termios field")),
             line: bytes[16],
             cc,
-            ispeed: u32::from_le_bytes(bytes[52..56].try_into().expect("fixed termios field")),
-            ospeed: u32::from_le_bytes(bytes[56..60].try_into().expect("fixed termios field")),
         })
     }
 
@@ -581,8 +584,6 @@ impl LinuxTermios {
         bytes[12..16].copy_from_slice(&self.lflag.to_le_bytes());
         bytes[16] = self.line;
         bytes[17..17 + NCCS].copy_from_slice(&self.cc);
-        bytes[52..56].copy_from_slice(&self.ispeed.to_le_bytes());
-        bytes[56..60].copy_from_slice(&self.ospeed.to_le_bytes());
         memory.write_bytes(addr, &bytes)?;
         Ok(())
     }
@@ -616,8 +617,6 @@ impl Default for LinuxTermios {
             lflag: ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN,
             line: 0,
             cc,
-            ispeed: B38400,
-            ospeed: B38400,
         }
     }
 }
@@ -683,6 +682,7 @@ impl LinuxProcess {
             brk: 0x0000_7000_0000_0000,
             mmap_next: 0x0000_7100_0000_0000,
             fs_base: 0,
+            set_tid_address: 0,
             fd_table: FdTable::new(),
             terminal: TerminalState::default(),
             trace: Vec::new(),
@@ -729,6 +729,7 @@ impl LinuxProcess {
         self.executable_path = executable_path.into();
         self.fd_table.close_on_exec();
         self.fs_base = 0;
+        self.set_tid_address = 0;
     }
 
     fn try_clone_for_child(&self, child_pid: u32) -> Result<Self, SyscallError> {
@@ -745,6 +746,7 @@ impl LinuxProcess {
             brk: self.brk,
             mmap_next: self.mmap_next,
             fs_base: self.fs_base,
+            set_tid_address: self.set_tid_address,
             fd_table: self.fd_table.duplicate_all()?,
             terminal: self.terminal.clone(),
             trace: Vec::new(),
@@ -945,6 +947,21 @@ impl ProcessTable {
         let child_process = parent.try_clone_for_child(child_pid.0)?;
         let mut child_registers = registers;
         child_registers.rax = 0;
+        let mut child_memory = memory.clone();
+        if child_process.set_tid_address != 0 {
+            child_memory.write_u32(child_process.set_tid_address, child_process.tid)?;
+        }
+        if child_process.fs_base != 0 {
+            if child_memory
+                .permissions_at(child_process.fs_base + GLIBC_PTHREAD_TID_OFFSET)
+                .is_some()
+            {
+                child_memory.write_u32(
+                    child_process.fs_base + GLIBC_PTHREAD_TID_OFFSET,
+                    child_process.tid,
+                )?;
+            }
+        }
         let tid = ThreadId(child_process.tid);
         let mut threads = HashMap::new();
         threads.insert(
@@ -960,7 +977,7 @@ impl ProcessTable {
             child_pid,
             ProcessRecord {
                 process: child_process,
-                memory: memory.clone(),
+                memory: child_memory,
                 threads,
                 parent: Some(ProcessId(parent.pid)),
                 children: Vec::new(),
@@ -1297,10 +1314,18 @@ impl SyscallDispatcher {
                 return Ok(SyscallOutcome::Exit(args[0] as i32));
             }
             SyscallNumber::Brk => process.brk(context.memory, args[0])? as i64,
-            SyscallNumber::Mmap => process.mmap(context.memory, args[0], args[1], args[2])? as i64,
+            SyscallNumber::Mmap => process.mmap(
+                context.memory,
+                args[0],
+                args[1],
+                args[2],
+                args[3],
+                args[4],
+                args[5],
+            )? as i64,
             SyscallNumber::Munmap => {
                 let size = align_up(args[1], PAGE_SIZE);
-                context.memory.unmap_region(args[0], size)?;
+                context.memory.unmap_range(args[0], size)?;
                 0
             }
             SyscallNumber::Mprotect => {
@@ -1472,7 +1497,13 @@ impl SyscallDispatcher {
             | SyscallNumber::Sigaltstack
             | SyscallNumber::SetRobustList
             | SyscallNumber::Prlimit64 => 0,
-            SyscallNumber::SetTidAddress => i64::from(process.tid),
+            SyscallNumber::SetTidAddress => {
+                process.set_tid_address = args[0];
+                if args[0] != 0 {
+                    context.memory.write_u32(args[0], process.tid)?;
+                }
+                i64::from(process.tid)
+            }
             SyscallNumber::Getrandom => {
                 let len = usize_arg(args[1])?;
                 let bytes = deterministic_random(len);
@@ -1713,7 +1744,7 @@ impl FdTable {
     pub fn stat(&self, fd: i32) -> Result<StatData, SyscallError> {
         let slot = self.entries.get(&fd).ok_or(Errno::Badf)?;
         match &slot.entry {
-            FdEntry::File(file) => stat_from_metadata(file.metadata().map_err(map_io_errno)?),
+            FdEntry::File(file) => stat_from_metadata(file.metadata().map_err(map_io_errno)?, None),
             FdEntry::Directory(directory) => write_stat_data_for_path(&directory.path),
             FdEntry::Virtual(file) => Ok(file.stat()),
             FdEntry::Stdin
@@ -1948,7 +1979,7 @@ impl VirtualFd {
             | VirtualFile::DevZero
             | VirtualFile::DevRandom
             | VirtualFile::DevURandom => StatData::char_device(),
-            _ => StatData::regular(self.data.len() as u64),
+            _ => StatData::regular(0x1000, 0x1000, 1, self.data.len() as u64),
         }
     }
 }
@@ -2047,7 +2078,13 @@ impl LinuxProcess {
         if requested < self.brk_base {
             return Ok(self.brk);
         }
-        if requested > self.brk {
+        if requested < self.brk {
+            let unmap_start = align_up(requested, PAGE_SIZE);
+            let unmap_end = align_up(self.brk, PAGE_SIZE);
+            if unmap_end > unmap_start {
+                memory.unmap_range(unmap_start, unmap_end - unmap_start)?;
+            }
+        } else if requested > self.brk {
             let map_start = align_up(self.brk, PAGE_SIZE);
             let map_end = align_up(requested, PAGE_SIZE);
             if map_end > map_start {
@@ -2069,25 +2106,76 @@ impl LinuxProcess {
         requested_addr: u64,
         len: u64,
         prot: u64,
+        flags: u64,
+        fd: u64,
+        offset: u64,
     ) -> Result<u64, SyscallError> {
         if len == 0 {
             return Err(Errno::Inval.into());
         }
+        if offset % PAGE_SIZE != 0 {
+            return Err(Errno::Inval.into());
+        }
         let size = align_up(len, PAGE_SIZE);
-        let address = if requested_addr == 0 {
+        let requested_end = requested_addr.checked_add(size);
+        let hint_is_free = requested_end.is_some_and(|end| {
+            !memory
+                .map()
+                .regions()
+                .iter()
+                .any(|region| requested_addr < region.end() && region.base() < end)
+        });
+        let address = if flags & MAP_FIXED != 0 {
+            if requested_addr % PAGE_SIZE != 0 {
+                return Err(Errno::Inval.into());
+            }
+            requested_addr
+        } else if requested_addr != 0 && hint_is_free {
+            requested_addr
+        } else if requested_addr == 0 {
             let address = self.mmap_next;
             self.mmap_next = self.mmap_next.saturating_add(size + PAGE_SIZE);
             address
         } else {
-            requested_addr
+            let address = self.mmap_next;
+            self.mmap_next = self.mmap_next.saturating_add(size + PAGE_SIZE);
+            address
         };
+        if flags & MAP_FIXED != 0 {
+            memory.unmap_range(address, size)?;
+        }
         memory.map_region(
             address,
             size,
             memory_permissions(prot),
             Some("[mmap]".to_string()),
         )?;
+        if flags & MAP_ANONYMOUS == 0 {
+            self.load_mmap_backing(memory, address, len, fd, offset, flags)?;
+        }
         Ok(address)
+    }
+
+    fn load_mmap_backing(
+        &mut self,
+        memory: &mut GuestMemory,
+        address: u64,
+        len: u64,
+        fd: u64,
+        offset: u64,
+        flags: u64,
+    ) -> Result<(), SyscallError> {
+        if flags & MAP_PRIVATE == 0 {
+            return Err(Errno::Inval.into());
+        }
+        let fd = fd_arg(fd)?;
+        let read_len = usize_arg(len)?;
+        let mut bytes = vec![0; read_len];
+        let read = read_sendfile_chunk(self, fd, &mut Some(offset), &mut bytes)?;
+        if read > 0 {
+            memory.load_bytes(address, &bytes[..read])?;
+        }
+        Ok(())
     }
 
     fn write_stat_for_guest_path(
@@ -2244,22 +2332,31 @@ impl From<FsError> for SyscallError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatData {
+    dev: u64,
+    ino: u64,
+    nlink: u64,
     mode: u32,
     size: u64,
     blocks: u64,
 }
 
 impl StatData {
-    fn regular(size: u64) -> Self {
+    fn regular(dev: u64, ino: u64, nlink: u64, size: u64) -> Self {
         Self {
+            dev,
+            ino,
+            nlink,
             mode: 0o100644,
             size,
             blocks: size.div_ceil(512),
         }
     }
 
-    fn directory() -> Self {
+    fn directory(dev: u64, ino: u64, nlink: u64) -> Self {
         Self {
+            dev,
+            ino,
+            nlink,
             mode: 0o040755,
             size: 0,
             blocks: 0,
@@ -2268,6 +2365,9 @@ impl StatData {
 
     fn char_device() -> Self {
         Self {
+            dev: 5,
+            ino: 1,
+            nlink: 1,
             mode: 0o020666,
             size: 0,
             blocks: 0,
@@ -2285,28 +2385,50 @@ fn write_stat_for_path(
 }
 
 fn write_stat_data_for_path(path: &Path) -> Result<StatData, SyscallError> {
-    stat_from_metadata(fs::metadata(path).map_err(map_io_errno)?)
+    stat_from_metadata(fs::metadata(path).map_err(map_io_errno)?, Some(path))
 }
 
-fn stat_from_metadata(metadata: fs::Metadata) -> Result<StatData, SyscallError> {
+fn stat_from_metadata(
+    metadata: fs::Metadata,
+    path: Option<&Path>,
+) -> Result<StatData, SyscallError> {
+    let (dev, ino, nlink) = metadata_identity(&metadata, path);
     if metadata.is_dir() {
-        Ok(StatData::directory())
+        Ok(StatData::directory(dev, ino, nlink))
     } else {
-        Ok(StatData::regular(metadata.len()))
+        Ok(StatData::regular(dev, ino, nlink, metadata.len()))
     }
 }
 
 fn write_stat(memory: &mut GuestMemory, addr: u64, data: StatData) -> Result<(), SyscallError> {
     let mut bytes = vec![0; STAT_SIZE];
-    write_u64(&mut bytes, 0, 1);
-    write_u64(&mut bytes, 8, 1);
-    write_u64(&mut bytes, 16, 1);
+    write_u64(&mut bytes, 0, data.dev);
+    write_u64(&mut bytes, 8, data.ino);
+    write_u64(&mut bytes, 16, data.nlink);
     write_u32(&mut bytes, 24, data.mode);
     write_u64(&mut bytes, 48, data.size);
     write_u64(&mut bytes, 56, 4096);
     write_u64(&mut bytes, 64, data.blocks);
     memory.write_bytes(addr, &bytes)?;
     Ok(())
+}
+
+fn metadata_identity(metadata: &fs::Metadata, path: Option<&Path>) -> (u64, u64, u64) {
+    let mut hasher = DefaultHasher::new();
+    metadata.len().hash(&mut hasher);
+    metadata.is_dir().hash(&mut hasher);
+    metadata.permissions().readonly().hash(&mut hasher);
+    if let Ok(modified) = metadata.modified() {
+        if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
+            duration.as_secs().hash(&mut hasher);
+            duration.subsec_nanos().hash(&mut hasher);
+        }
+    }
+    if let Some(path) = path {
+        path.hash(&mut hasher);
+    }
+    let ino = hasher.finish().max(1);
+    (1, ino, 1)
 }
 
 fn write_uname(memory: &mut GuestMemory, addr: u64) -> Result<(), SyscallError> {
@@ -2720,7 +2842,14 @@ mod tests {
             },
             SyscallInput {
                 number: SyscallNumber::Mmap.raw(),
-                args: [0, 4096, PROT_READ | PROT_WRITE, 0, 0, 0],
+                args: [
+                    0,
+                    4096,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS,
+                    0,
+                    0,
+                ],
             },
         );
         let SyscallOutcome::Return(addr) = mapped else {
@@ -2744,6 +2873,105 @@ mod tests {
             memory.read_u8(addr as u64),
             Err(GuestMemoryError::Unmapped { .. })
         ));
+    }
+
+    #[test]
+    fn brk_can_shrink_and_regrow_without_overlap_faults() {
+        let mut process = LinuxProcess::new(None);
+        let mut memory = GuestMemory::new();
+
+        assert_eq!(
+            process.brk(&mut memory, 0x7000_0000_3000).unwrap(),
+            0x7000_0000_3000
+        );
+        assert_eq!(
+            process.brk(&mut memory, 0x7000_0000_1000).unwrap(),
+            0x7000_0000_1000
+        );
+        assert_eq!(
+            process.brk(&mut memory, 0x7000_0000_3000).unwrap(),
+            0x7000_0000_3000
+        );
+        memory.write_u8(0x7000_0000_1000, 0xaa).unwrap();
+        assert_eq!(memory.read_u8(0x7000_0000_1000).unwrap(), 0xaa);
+    }
+
+    #[test]
+    fn mmap_loads_file_backed_contents() {
+        let root = std::env::temp_dir().join(format!(
+            "ruxeon-mmap-file-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("blob"), b"linux").unwrap();
+
+        let mut process = LinuxProcess::new(Some(root.clone()));
+        let mut memory = GuestMemory::new();
+        let fd = process.open_guest_path(None, "/blob", 0).unwrap();
+        let addr = process
+            .mmap(&mut memory, 0, 5, PROT_READ, MAP_PRIVATE, fd as u64, 0)
+            .unwrap();
+
+        assert_eq!(memory.read_bytes(addr, 5).unwrap(), b"linux");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mmap_fixed_replaces_existing_mapping() {
+        let root = std::env::temp_dir().join(format!(
+            "ruxeon-mmap-fixed-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("blob"), b"abcd").unwrap();
+
+        let mut process = LinuxProcess::new(Some(root.clone()));
+        let mut memory = GuestMemory::new();
+        let initial = process
+            .mmap(
+                &mut memory,
+                0x4000,
+                PAGE_SIZE,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                (-1i64) as u64,
+                0,
+            )
+            .unwrap();
+        memory.write_u8(initial, 0xaa).unwrap();
+
+        let fd = process.open_guest_path(None, "/blob", 0).unwrap();
+        let replaced = process
+            .mmap(
+                &mut memory,
+                0x4000,
+                4,
+                PROT_READ,
+                MAP_PRIVATE | MAP_FIXED,
+                fd as u64,
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(replaced, initial);
+        assert_eq!(memory.read_bytes(replaced, 4).unwrap(), b"abcd");
+        assert!(matches!(
+            memory.write_u8(replaced, 0xbb),
+            Err(GuestMemoryError::Permission { .. })
+        ));
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

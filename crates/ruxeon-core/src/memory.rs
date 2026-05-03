@@ -256,6 +256,53 @@ impl GuestMemory {
         Ok(())
     }
 
+    pub fn unmap_range(&mut self, base: u64, size: u64) -> Result<(), GuestMemoryError> {
+        if size == 0 {
+            return Err(GuestMemoryError::EmptyMapping);
+        }
+        let end = base
+            .checked_add(size)
+            .ok_or(GuestMemoryError::AddressOverflow { base, size })?;
+        let mut updated = Vec::with_capacity(self.map.regions.len());
+
+        for region in self.map.regions.drain(..) {
+            let overlap_start = region.base.max(base);
+            let overlap_end = region.end().min(end);
+            if overlap_start >= overlap_end {
+                updated.push(region);
+                continue;
+            }
+
+            let before_size = overlap_start - region.base;
+            if before_size > 0 {
+                let before_len = before_size as usize;
+                updated.push(MemoryRegion {
+                    base: region.base,
+                    size: before_size,
+                    permissions: region.permissions,
+                    name: region.name.clone(),
+                    data: region.data[..before_len].to_vec(),
+                });
+            }
+
+            let after_size = region.end() - overlap_end;
+            if after_size > 0 {
+                let after_offset = (overlap_end - region.base) as usize;
+                updated.push(MemoryRegion {
+                    base: overlap_end,
+                    size: after_size,
+                    permissions: region.permissions,
+                    name: region.name.clone(),
+                    data: region.data[after_offset..].to_vec(),
+                });
+            }
+        }
+
+        updated.sort_by_key(|region| region.base);
+        self.map.regions = updated;
+        Ok(())
+    }
+
     pub fn permissions_at(&self, addr: u64) -> Option<MemoryPermission> {
         self.map
             .regions
@@ -461,6 +508,32 @@ mod tests {
 
         assert!(matches!(
             memory.read_u8(0x1000),
+            Err(GuestMemoryError::Unmapped { .. })
+        ));
+    }
+
+    #[test]
+    fn unmap_range_splits_regions_around_removed_pages() {
+        let mut memory = GuestMemory::new();
+        memory
+            .map_region(
+                0x1000,
+                PAGE_SIZE * 3,
+                MemoryPermission::READ | MemoryPermission::WRITE,
+                Some("data".to_string()),
+            )
+            .unwrap();
+        memory.write_u8(0x1000, 1).unwrap();
+        memory.write_u8(0x2000, 2).unwrap();
+        memory.write_u8(0x3000, 3).unwrap();
+
+        memory.unmap_range(0x2000, PAGE_SIZE).unwrap();
+
+        assert_eq!(memory.map().regions().len(), 2);
+        assert_eq!(memory.read_u8(0x1000).unwrap(), 1);
+        assert_eq!(memory.read_u8(0x3000).unwrap(), 3);
+        assert!(matches!(
+            memory.read_u8(0x2000),
             Err(GuestMemoryError::Unmapped { .. })
         ));
     }

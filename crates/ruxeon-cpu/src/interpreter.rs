@@ -18,6 +18,9 @@ use thiserror::Error;
 
 const MAX_INSTRUCTION_LEN: usize = 15;
 const MAX_BLOCK_INSTRUCTIONS: usize = 64;
+const VSYSCALL_GETTIMEOFDAY: u64 = 0xffffffffff600000;
+const VSYSCALL_TIME: u64 = 0xffffffffff600400;
+const VSYSCALL_GETCPU: u64 = 0xffffffffff600800;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsupportedInstructionRecord {
@@ -196,6 +199,9 @@ impl Interpreter {
     }
 
     pub fn step(&mut self) -> Result<StepOutcome, CpuError> {
+        if let Some(outcome) = self.handle_vsyscall()? {
+            return Ok(outcome);
+        }
         let ip = self.registers.rip;
         let instruction = self.decode(ip)?;
         if instruction.code() == Code::INVALID {
@@ -223,6 +229,9 @@ impl Interpreter {
     }
 
     pub fn step_block(&mut self) -> Result<StepOutcome, CpuError> {
+        if let Some(outcome) = self.handle_vsyscall()? {
+            return Ok(outcome);
+        }
         let start_ip = self.registers.rip;
         let (block, instructions) = self.cached_block(start_ip)?;
         for (index, instruction) in instructions.iter().enumerate() {
@@ -360,12 +369,31 @@ impl Interpreter {
                 self.execute_xchg(instruction)?;
                 StepOutcome::Continue
             }
+            Mnemonic::Xadd => {
+                self.execute_xadd(instruction)?;
+                StepOutcome::Continue
+            }
             Mnemonic::Movdqa | Mnemonic::Movdqu | Mnemonic::Movups | Mnemonic::Movaps => {
                 self.execute_xmm_move(instruction)?;
                 StepOutcome::Continue
             }
-            Mnemonic::Punpcklqdq => {
-                self.execute_punpcklqdq(instruction)?;
+            Mnemonic::Movlpd => {
+                self.execute_mov_half_pd(instruction, false)?;
+                StepOutcome::Continue
+            }
+            Mnemonic::Movhpd => {
+                self.execute_mov_half_pd(instruction, true)?;
+                StepOutcome::Continue
+            }
+            Mnemonic::Punpcklbw
+            | Mnemonic::Punpcklwd
+            | Mnemonic::Punpckldq
+            | Mnemonic::Punpcklqdq
+            | Mnemonic::Punpckhbw
+            | Mnemonic::Punpckhwd
+            | Mnemonic::Punpckhdq
+            | Mnemonic::Punpckhqdq => {
+                self.execute_punpck(instruction)?;
                 StepOutcome::Continue
             }
             Mnemonic::Pxor | Mnemonic::Xorps | Mnemonic::Xorpd => {
@@ -380,12 +408,32 @@ impl Interpreter {
                 self.execute_xmm_binary(instruction, XmmBinaryOp::And)?;
                 StepOutcome::Continue
             }
+            Mnemonic::Pcmpeqb | Mnemonic::Pcmpeqw | Mnemonic::Pcmpeqd | Mnemonic::Pcmpeqq => {
+                self.execute_packed_compare_equal(instruction)?;
+                StepOutcome::Continue
+            }
+            Mnemonic::Pmovmskb => {
+                self.execute_pmovmskb(instruction)?;
+                StepOutcome::Continue
+            }
+            Mnemonic::Pminub | Mnemonic::Pmaxub => {
+                self.execute_packed_byte_minmax(instruction)?;
+                StepOutcome::Continue
+            }
+            Mnemonic::Paddb | Mnemonic::Psubb => {
+                self.execute_packed_byte_arithmetic(instruction)?;
+                StepOutcome::Continue
+            }
             Mnemonic::Pshufd => {
                 self.execute_pshufd(instruction)?;
                 StepOutcome::Continue
             }
             Mnemonic::Shufps => {
                 self.execute_shufps(instruction)?;
+                StepOutcome::Continue
+            }
+            Mnemonic::Pslldq | Mnemonic::Psrldq => {
+                self.execute_packed_byte_shift(instruction)?;
                 StepOutcome::Continue
             }
             Mnemonic::Pslld | Mnemonic::Psrld | Mnemonic::Psllq | Mnemonic::Psrlq => {
@@ -396,9 +444,41 @@ impl Interpreter {
                 self.execute_stos(instruction)?;
                 StepOutcome::Continue
             }
-            Mnemonic::Movsb | Mnemonic::Movsw | Mnemonic::Movsd | Mnemonic::Movsq => {
+            Mnemonic::Movsb | Mnemonic::Movsw | Mnemonic::Movsq => {
                 self.execute_movs(instruction)?;
                 StepOutcome::Continue
+            }
+            Mnemonic::Movsd => {
+                match instruction.code() {
+                    Code::Movsd_m32_m32 => self.execute_movs(instruction)?,
+                    Code::Movsd_xmm_xmmm64 | Code::Movsd_xmmm64_xmm => {
+                        self.execute_mov_simd_scalar(instruction, 64)?
+                    }
+                    _ => {
+                        return Err(CpuError::UnsupportedInstruction {
+                            record: self.unsupported_instruction_record(instruction, text)?,
+                        });
+                    }
+                }
+                StepOutcome::Continue
+            }
+            Mnemonic::Scasb | Mnemonic::Scasw | Mnemonic::Scasd | Mnemonic::Scasq => {
+                self.execute_scas(instruction)?;
+                StepOutcome::Continue
+            }
+            Mnemonic::Cmpsb | Mnemonic::Cmpsw | Mnemonic::Cmpsq => {
+                self.execute_cmps(instruction)?;
+                StepOutcome::Continue
+            }
+            Mnemonic::Cmpsd => {
+                if instruction.code() == Code::Cmpsd_m32_m32 {
+                    self.execute_cmps(instruction)?;
+                    StepOutcome::Continue
+                } else {
+                    return Err(CpuError::UnsupportedInstruction {
+                        record: self.unsupported_instruction_record(instruction, text)?,
+                    });
+                }
             }
             Mnemonic::Cbw => {
                 let ax = sign_extend(self.registers.rax & 0xff, 8) & 0xffff;
@@ -484,6 +564,10 @@ impl Interpreter {
                 self.execute_unary(instruction, UnaryOp::Dec)?;
                 StepOutcome::Continue
             }
+            Mnemonic::Rol | Mnemonic::Ror => {
+                self.execute_rotate(instruction)?;
+                StepOutcome::Continue
+            }
             Mnemonic::Bswap => {
                 self.execute_bswap(instruction)?;
                 StepOutcome::Continue
@@ -510,6 +594,10 @@ impl Interpreter {
             }
             Mnemonic::Bt => {
                 self.execute_bit_test(instruction)?;
+                StepOutcome::Continue
+            }
+            Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc => {
+                self.execute_bit_modify(instruction)?;
                 StepOutcome::Continue
             }
             Mnemonic::Bsf => {
@@ -599,6 +687,11 @@ impl Interpreter {
                 rip_written = true;
                 StepOutcome::Continue
             }
+            Mnemonic::Leave => {
+                self.registers.rsp = self.registers.rbp;
+                self.registers.rbp = self.pop_u64()?;
+                StepOutcome::Continue
+            }
             Mnemonic::Push => {
                 let value = self.read_operand(instruction, 0, 64)?;
                 self.push_u64(value)?;
@@ -630,6 +723,10 @@ impl Interpreter {
             }
             Mnemonic::Rdtsc => {
                 self.execute_rdtsc();
+                StepOutcome::Continue
+            }
+            Mnemonic::Cpuid => {
+                self.execute_cpuid()?;
                 StepOutcome::Continue
             }
             _ => {
@@ -758,6 +855,44 @@ impl Interpreter {
         Ok(())
     }
 
+    fn execute_rotate(&mut self, instruction: &Instruction) -> Result<(), CpuError> {
+        let width = self.destination_width(instruction, 0)?;
+        let value = self.read_operand(instruction, 0, width)? & mask(width);
+        let modulus = u64::from(width);
+        let raw_count = self.read_operand(instruction, 1, 8)?;
+        let count = if width == 64 {
+            raw_count & 0x3f
+        } else {
+            raw_count & 0x1f
+        } % modulus;
+        if count == 0 {
+            return Ok(());
+        }
+
+        let result = match instruction.mnemonic() {
+            Mnemonic::Rol => ((value << count) | (value >> (modulus - count))) & mask(width),
+            Mnemonic::Ror => ((value >> count) | (value << (modulus - count))) & mask(width),
+            _ => unreachable!("checked by caller"),
+        };
+
+        let carry = match instruction.mnemonic() {
+            Mnemonic::Rol => (result & 1) != 0,
+            Mnemonic::Ror => ((result >> (width - 1)) & 1) != 0,
+            _ => unreachable!("checked by caller"),
+        };
+        self.registers.set_flag(FLAG_CF, carry);
+        if count == 1 {
+            let overflow = match instruction.mnemonic() {
+                Mnemonic::Rol => (((result >> (width - 1)) ^ result) & 1) != 0,
+                Mnemonic::Ror => (((result >> (width - 1)) ^ (result >> (width - 2))) & 1) != 0,
+                _ => unreachable!("checked by caller"),
+            };
+            self.registers.set_flag(FLAG_OF, overflow);
+        }
+        self.write_operand(instruction, 0, result, width)?;
+        Ok(())
+    }
+
     fn execute_rdtsc(&mut self) {
         let ticks = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -765,6 +900,90 @@ impl Interpreter {
             .unwrap_or(0);
         self.registers.rax = ticks & 0xffff_ffff;
         self.registers.rdx = ticks >> 32;
+    }
+
+    fn handle_vsyscall(&mut self) -> Result<Option<StepOutcome>, CpuError> {
+        let rip = self.registers.rip;
+        if rip != VSYSCALL_GETTIMEOFDAY && rip != VSYSCALL_TIME && rip != VSYSCALL_GETCPU {
+            return Ok(None);
+        }
+
+        match rip {
+            VSYSCALL_GETTIMEOFDAY => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default();
+                if self.registers.rdi != 0 {
+                    self.memory.write_u64(self.registers.rdi, now.as_secs())?;
+                    self.memory
+                        .write_u64(self.registers.rdi + 8, u64::from(now.subsec_micros()))?;
+                }
+                self.registers.rax = 0;
+            }
+            VSYSCALL_TIME => {
+                let seconds = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if self.registers.rdi != 0 {
+                    self.memory.write_u64(self.registers.rdi, seconds)?;
+                }
+                self.registers.rax = seconds;
+            }
+            VSYSCALL_GETCPU => {
+                if self.registers.rdi != 0 {
+                    self.memory.write_u32(self.registers.rdi, 0)?;
+                }
+                if self.registers.rsi != 0 {
+                    self.memory.write_u32(self.registers.rsi, 0)?;
+                }
+                self.registers.rax = 0;
+            }
+            _ => unreachable!("checked above"),
+        }
+
+        self.registers.rip = self.pop_u64()?;
+        Ok(Some(StepOutcome::Continue))
+    }
+
+    fn execute_cpuid(&mut self) -> Result<(), CpuError> {
+        let leaf = self.registers.rax as u32;
+        let subleaf = self.registers.rcx as u32;
+        let (eax, ebx, ecx, edx) = match leaf {
+            0 => (
+                0x0000_0007,
+                u32::from_le_bytes(*b"Genu"),
+                u32::from_le_bytes(*b"ntel"),
+                u32::from_le_bytes(*b"ineI"),
+            ),
+            1 => {
+                let eax = 0x0003_06a9u32;
+                let ecx = 0u32;
+                let edx = (1 << 0)
+                    | (1 << 4)
+                    | (1 << 5)
+                    | (1 << 8)
+                    | (1 << 15)
+                    | (1 << 19)
+                    | (1 << 23)
+                    | (1 << 24)
+                    | (1 << 25)
+                    | (1 << 26);
+                (eax, 0, ecx, edx)
+            }
+            7 if subleaf == 0 => (0u32, 0u32, 0u32, 0u32),
+            0x8000_0000 => (0x8000_0001u32, 0u32, 0u32, 0u32),
+            0x8000_0001 => {
+                let edx = (1u32 << 20) | (1u32 << 29);
+                (0u32, 0u32, 0u32, edx)
+            }
+            _ => (0u32, 0u32, 0u32, 0u32),
+        };
+        self.registers.write(Register::EAX, u64::from(eax))?;
+        self.registers.write(Register::EBX, u64::from(ebx))?;
+        self.registers.write(Register::ECX, u64::from(ecx))?;
+        self.registers.write(Register::EDX, u64::from(edx))?;
+        Ok(())
     }
 
     fn execute_mov_simd_scalar(
@@ -797,6 +1016,17 @@ impl Interpreter {
         let right = self.read_operand(instruction, 1, width)?;
         self.write_operand(instruction, 0, right, width)?;
         self.write_operand(instruction, 1, left, width)?;
+        Ok(())
+    }
+
+    fn execute_xadd(&mut self, instruction: &Instruction) -> Result<(), CpuError> {
+        let width = self.destination_width(instruction, 0)?;
+        let destination = self.read_operand(instruction, 0, width)? & mask(width);
+        let source = self.read_operand(instruction, 1, width)? & mask(width);
+        let result = destination.wrapping_add(source) & mask(width);
+        self.set_add_flags(destination, source, result, width);
+        self.write_operand(instruction, 0, result, width)?;
+        self.write_operand(instruction, 1, destination, width)?;
         Ok(())
     }
 
@@ -861,12 +1091,83 @@ impl Interpreter {
         self.write_xmm_operand(instruction, 0, value)
     }
 
-    fn execute_punpcklqdq(&mut self, instruction: &Instruction) -> Result<(), CpuError> {
+    fn execute_mov_half_pd(
+        &mut self,
+        instruction: &Instruction,
+        high_half: bool,
+    ) -> Result<(), CpuError> {
+        match (instruction.op_kind(0), instruction.op_kind(1)) {
+            (OpKind::Register, OpKind::Memory) => {
+                let register = instruction.op_register(0);
+                let index = xmm_index(register).ok_or_else(|| CpuError::UnsupportedOperand {
+                    ip: instruction.ip(),
+                    instruction: format_instruction(instruction),
+                })?;
+                let value = little_endian_to_u64(
+                    &self
+                        .memory
+                        .read_bytes(self.effective_address(instruction)?, 8)?,
+                ) as u128;
+                let preserved = self.registers.xmm[index];
+                self.registers.xmm[index] = if high_half {
+                    (preserved & u128::from(u64::MAX)) | (value << 64)
+                } else {
+                    (preserved & (!u128::from(u64::MAX))) | value
+                };
+                Ok(())
+            }
+            (OpKind::Memory, OpKind::Register) => {
+                let index = xmm_index(instruction.op_register(1)).ok_or_else(|| {
+                    CpuError::UnsupportedOperand {
+                        ip: instruction.ip(),
+                        instruction: format_instruction(instruction),
+                    }
+                })?;
+                let raw = self.registers.xmm[index];
+                let value = if high_half {
+                    (raw >> 64) as u64
+                } else {
+                    raw as u64
+                };
+                self.memory
+                    .write_bytes(self.effective_address(instruction)?, &value.to_le_bytes())?;
+                Ok(())
+            }
+            _ => Err(CpuError::UnsupportedOperand {
+                ip: instruction.ip(),
+                instruction: format_instruction(instruction),
+            }),
+        }
+    }
+
+    fn execute_punpck(&mut self, instruction: &Instruction) -> Result<(), CpuError> {
         let destination = self.read_xmm_operand(instruction, 0)?;
         let source = self.read_xmm_operand(instruction, 1)?;
-        let low = destination & u128::from(u64::MAX);
-        let high = (source & u128::from(u64::MAX)) << 64;
-        self.write_xmm_operand(instruction, 0, high | low)
+        let (lane_bits, high_half) = match instruction.mnemonic() {
+            Mnemonic::Punpcklbw => (8, false),
+            Mnemonic::Punpcklwd => (16, false),
+            Mnemonic::Punpckldq => (32, false),
+            Mnemonic::Punpcklqdq => (64, false),
+            Mnemonic::Punpckhbw => (8, true),
+            Mnemonic::Punpckhwd => (16, true),
+            Mnemonic::Punpckhdq => (32, true),
+            Mnemonic::Punpckhqdq => (64, true),
+            _ => unreachable!("checked by caller"),
+        };
+        let lane_mask = mask(lane_bits) as u128;
+        let half_bits = 64u32;
+        let lanes_per_half = half_bits / lane_bits;
+        let base_shift = if high_half { half_bits } else { 0 };
+        let mut result = 0u128;
+        for lane in 0..lanes_per_half {
+            let shift = base_shift + lane * lane_bits;
+            let left = (destination >> shift) & lane_mask;
+            let right = (source >> shift) & lane_mask;
+            let output_shift = lane * lane_bits * 2;
+            result |= left << output_shift;
+            result |= right << (output_shift + lane_bits);
+        }
+        self.write_xmm_operand(instruction, 0, result)
     }
 
     fn execute_xmm_binary(
@@ -881,6 +1182,82 @@ impl Interpreter {
             XmmBinaryOp::Or => left | right,
             XmmBinaryOp::And => left & right,
         };
+        self.write_xmm_operand(instruction, 0, result)
+    }
+
+    fn execute_packed_compare_equal(&mut self, instruction: &Instruction) -> Result<(), CpuError> {
+        let left = self.read_xmm_operand(instruction, 0)?;
+        let right = self.read_xmm_operand(instruction, 1)?;
+        let lane_bits = match instruction.mnemonic() {
+            Mnemonic::Pcmpeqb => 8,
+            Mnemonic::Pcmpeqw => 16,
+            Mnemonic::Pcmpeqd => 32,
+            Mnemonic::Pcmpeqq => 64,
+            _ => unreachable!("checked by caller"),
+        };
+        let lane_mask = mask(lane_bits) as u128;
+        let lanes = 128 / lane_bits;
+        let mut result = 0u128;
+        for lane in 0..lanes {
+            let shift = lane * lane_bits;
+            let left_lane = (left >> shift) & lane_mask;
+            let right_lane = (right >> shift) & lane_mask;
+            if left_lane == right_lane {
+                result |= lane_mask << shift;
+            }
+        }
+        self.write_xmm_operand(instruction, 0, result)
+    }
+
+    fn execute_pmovmskb(&mut self, instruction: &Instruction) -> Result<(), CpuError> {
+        let value = self.read_xmm_operand(instruction, 1)?;
+        let mut result = 0u64;
+        for byte in 0..16u32 {
+            let byte_value = ((value >> (byte * 8)) & 0xff) as u8;
+            if byte_value & 0x80 != 0 {
+                result |= 1u64 << byte;
+            }
+        }
+        let width = self.destination_width(instruction, 0)?;
+        self.write_operand(instruction, 0, result, width)
+    }
+
+    fn execute_packed_byte_minmax(&mut self, instruction: &Instruction) -> Result<(), CpuError> {
+        let left = self.read_xmm_operand(instruction, 0)?;
+        let right = self.read_xmm_operand(instruction, 1)?;
+        let mut result = 0u128;
+        for byte in 0..16u32 {
+            let shift = byte * 8;
+            let left_byte = ((left >> shift) & 0xff) as u8;
+            let right_byte = ((right >> shift) & 0xff) as u8;
+            let value = match instruction.mnemonic() {
+                Mnemonic::Pminub => left_byte.min(right_byte),
+                Mnemonic::Pmaxub => left_byte.max(right_byte),
+                _ => unreachable!("checked by caller"),
+            };
+            result |= u128::from(value) << shift;
+        }
+        self.write_xmm_operand(instruction, 0, result)
+    }
+
+    fn execute_packed_byte_arithmetic(
+        &mut self,
+        instruction: &Instruction,
+    ) -> Result<(), CpuError> {
+        let left = self.read_xmm_operand(instruction, 0)?;
+        let right = self.read_xmm_operand(instruction, 1)?;
+        let mut result = 0u128;
+        for byte in 0..16u32 {
+            let shift = byte * 8;
+            let left_byte = ((left >> shift) & 0xff) as u8;
+            let right_byte = ((right >> shift) & 0xff) as u8;
+            let value = match instruction.mnemonic() {
+                Mnemonic::Paddb => left_byte.wrapping_add(right_byte),
+                Mnemonic::Psubb => left_byte.wrapping_sub(right_byte),
+                _ => unreachable!("checked by caller"),
+            };
+            result |= u128::from(value) << shift;
+        }
         self.write_xmm_operand(instruction, 0, result)
     }
 
@@ -915,6 +1292,30 @@ impl Interpreter {
             let value = (source >> (u32::from(selectors[lane]) * 32)) & 0xffff_ffff;
             result |= value << (lane * 32);
         }
+        self.write_xmm_operand(instruction, 0, result)
+    }
+
+    fn execute_packed_byte_shift(&mut self, instruction: &Instruction) -> Result<(), CpuError> {
+        let value = self.read_xmm_operand(instruction, 0)?;
+        let count = self.read_operand(instruction, 1, 8)? as u32;
+        let shift = count.min(16) * 8;
+        let result = match instruction.mnemonic() {
+            Mnemonic::Pslldq => {
+                if shift >= 128 {
+                    0
+                } else {
+                    value << shift
+                }
+            }
+            Mnemonic::Psrldq => {
+                if shift >= 128 {
+                    0
+                } else {
+                    value >> shift
+                }
+            }
+            _ => unreachable!("checked by caller"),
+        };
         self.write_xmm_operand(instruction, 0, result)
     }
 
@@ -1084,12 +1485,120 @@ impl Interpreter {
         Ok(())
     }
 
+    fn execute_scas(&mut self, instruction: &Instruction) -> Result<(), CpuError> {
+        let width = match instruction.mnemonic() {
+            Mnemonic::Scasb => 8,
+            Mnemonic::Scasw => 16,
+            Mnemonic::Scasd => 32,
+            Mnemonic::Scasq => 64,
+            _ => unreachable!("checked by caller"),
+        };
+        let size = (width / 8) as usize;
+        let repeated = instruction.has_repe_prefix() || instruction.has_repne_prefix();
+        let mut count = if repeated { self.registers.rcx } else { 1 };
+        let step = if self.registers.flag(FLAG_DF) {
+            -(size as i64)
+        } else {
+            size as i64
+        };
+        let segment_base = self.segment_base(instruction.memory_segment());
+        let mut address = segment_base.wrapping_add(self.registers.rdi);
+
+        while count > 0 {
+            let scanned = little_endian_to_u64(&self.memory.read_bytes(address, size)?);
+            let accumulator = self.accumulator(width)? & mask(width);
+            let result = accumulator.wrapping_sub(scanned);
+            self.set_sub_flags(accumulator, scanned, result, width);
+            address = address.wrapping_add_signed(step);
+            count -= 1;
+
+            if instruction.has_repe_prefix() && !self.registers.flag(FLAG_ZF) {
+                break;
+            }
+            if instruction.has_repne_prefix() && self.registers.flag(FLAG_ZF) {
+                break;
+            }
+            if !repeated {
+                break;
+            }
+        }
+
+        self.registers.rdi = address.wrapping_sub(segment_base);
+        if repeated {
+            self.registers.rcx = count;
+        }
+        Ok(())
+    }
+
+    fn execute_cmps(&mut self, instruction: &Instruction) -> Result<(), CpuError> {
+        let width = match instruction.mnemonic() {
+            Mnemonic::Cmpsb => 8,
+            Mnemonic::Cmpsw => 16,
+            Mnemonic::Cmpsd => 32,
+            Mnemonic::Cmpsq => 64,
+            _ => unreachable!("checked by caller"),
+        };
+        let size = (width / 8) as usize;
+        let repeated = instruction.has_repe_prefix() || instruction.has_repne_prefix();
+        let mut count = if repeated { self.registers.rcx } else { 1 };
+        let step = if self.registers.flag(FLAG_DF) {
+            -(size as i64)
+        } else {
+            size as i64
+        };
+        let source_base = self.segment_base(instruction.memory_segment());
+        let mut source = source_base.wrapping_add(self.registers.rsi);
+        let mut destination = self.registers.rdi;
+
+        while count > 0 {
+            let left = little_endian_to_u64(&self.memory.read_bytes(source, size)?);
+            let right = little_endian_to_u64(&self.memory.read_bytes(destination, size)?);
+            let result = left.wrapping_sub(right);
+            self.set_sub_flags(left, right, result, width);
+            source = source.wrapping_add_signed(step);
+            destination = destination.wrapping_add_signed(step);
+            count -= 1;
+
+            if instruction.has_repe_prefix() && !self.registers.flag(FLAG_ZF) {
+                break;
+            }
+            if instruction.has_repne_prefix() && self.registers.flag(FLAG_ZF) {
+                break;
+            }
+            if !repeated {
+                break;
+            }
+        }
+
+        self.registers.rsi = source.wrapping_sub(source_base);
+        self.registers.rdi = destination;
+        if repeated {
+            self.registers.rcx = count;
+        }
+        Ok(())
+    }
+
     fn execute_bit_test(&mut self, instruction: &Instruction) -> Result<(), CpuError> {
         let width = self.destination_width(instruction, 0)?;
         let base = self.read_operand(instruction, 0, width)?;
         let bit = self.read_operand(instruction, 1, width)? % u64::from(width);
         self.registers.set_flag(FLAG_CF, ((base >> bit) & 1) != 0);
         Ok(())
+    }
+
+    fn execute_bit_modify(&mut self, instruction: &Instruction) -> Result<(), CpuError> {
+        let width = self.destination_width(instruction, 0)?;
+        let mut base = self.read_operand(instruction, 0, width)? & mask(width);
+        let bit = self.read_operand(instruction, 1, width)? % u64::from(width);
+        let mask = 1u64 << bit;
+        self.registers.set_flag(FLAG_CF, (base & mask) != 0);
+        match instruction.mnemonic() {
+            Mnemonic::Bts => base |= mask,
+            Mnemonic::Btr => base &= !mask,
+            Mnemonic::Btc => base ^= mask,
+            _ => unreachable!("checked by caller"),
+        }
+        self.write_operand(instruction, 0, base, width)
     }
 
     fn execute_mul(&mut self, instruction: &Instruction, signed: bool) -> Result<(), CpuError> {
@@ -1941,6 +2450,131 @@ mod tests {
 
         assert_eq!(cpu.run(16).unwrap(), RunOutcome::Exited(0));
         assert_eq!(cpu.registers().rbx, 0xfeed_face_cafe_beef);
+    }
+
+    #[test]
+    fn movsd_scalar_does_not_run_string_move_path() {
+        let mut cpu = interpreter(&[0xf2, 0x0f, 0x10, 0x04, 0x24]); // movsd xmm0, [rsp]
+        cpu.memory_mut()
+            .write_u64(STACK + 0x800, 0x1122_3344_5566_7788)
+            .unwrap();
+        cpu.registers_mut().rsi = 0x1111;
+        cpu.registers_mut().rdi = 0x2222;
+
+        assert_eq!(cpu.step().unwrap(), StepOutcome::Continue);
+        assert_eq!(cpu.registers().rsi, 0x1111);
+        assert_eq!(cpu.registers().rdi, 0x2222);
+        assert_eq!(cpu.registers().xmm[0] as u64, 0x1122_3344_5566_7788);
+    }
+
+    #[test]
+    fn repne_scasb_consumes_rcx_until_null_match() {
+        let mut cpu = interpreter(&[
+            0x48, 0xc7, 0xc1, 0xff, 0xff, 0xff, 0xff, // mov rcx, -1
+            0x48, 0xbf, 0x00, 0x81, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rdi, 0x8100
+            0x31, 0xc0, // xor eax, eax
+            0xf2, 0xae, // repne scasb
+        ]);
+        cpu.memory_mut().write_bytes(0x8100, b"abc\0").unwrap();
+
+        for _ in 0..4 {
+            assert_eq!(cpu.step().unwrap(), StepOutcome::Continue);
+        }
+
+        assert_eq!(cpu.registers().rdi, 0x8104);
+        assert_eq!(cpu.registers().rcx, u64::MAX - 4);
+        assert!(cpu.registers().flag(FLAG_ZF));
+    }
+
+    #[test]
+    fn repe_cmpsb_stops_after_first_mismatch() {
+        let mut cpu = interpreter(&[
+            0x48, 0xc7, 0xc1, 0x03, 0x00, 0x00, 0x00, // mov rcx, 3
+            0x48, 0xbe, 0x00, 0x81, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rsi, 0x8100
+            0x48, 0xbf, 0x10, 0x81, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rdi, 0x8110
+            0xf3, 0xa6, // repe cmpsb
+        ]);
+        cpu.memory_mut().write_bytes(0x8100, b"abz").unwrap();
+        cpu.memory_mut().write_bytes(0x8110, b"abc").unwrap();
+
+        for _ in 0..4 {
+            assert_eq!(cpu.step().unwrap(), StepOutcome::Continue);
+        }
+
+        assert_eq!(cpu.registers().rsi, 0x8103);
+        assert_eq!(cpu.registers().rdi, 0x8113);
+        assert_eq!(cpu.registers().rcx, 0);
+        assert!(!cpu.registers().flag(FLAG_ZF));
+    }
+
+    #[test]
+    fn movlpd_updates_only_the_low_qword() {
+        let mut cpu = interpreter(&[
+            0x66, 0x0f, 0x12, 0x04, 0x24, // movlpd xmm0, [rsp]
+        ]);
+        cpu.memory_mut()
+            .write_u64(STACK + 0x800, 0x1122_3344_5566_7788)
+            .unwrap();
+        cpu.registers_mut().xmm[0] =
+            (u128::from(0xaabb_ccdd_eeff_0011u64) << 64) | u128::from(0xdead_beef_dead_beefu64);
+
+        assert_eq!(cpu.step().unwrap(), StepOutcome::Continue);
+        assert_eq!(
+            cpu.registers().xmm[0],
+            (u128::from(0xaabb_ccdd_eeff_0011u64) << 64) | u128::from(0x1122_3344_5566_7788u64)
+        );
+    }
+
+    #[test]
+    fn psubb_wraps_each_byte_lane() {
+        let mut cpu = interpreter(&[
+            0x66, 0x0f, 0xf8, 0xc8, // psubb xmm1, xmm0
+        ]);
+        cpu.registers_mut().xmm[0] = u128::from(0x01_02_03_04_05_06_07_08u64);
+        cpu.registers_mut().xmm[1] = u128::from(0x08_07_06_05_04_03_02_01u64);
+
+        assert_eq!(cpu.step().unwrap(), StepOutcome::Continue);
+        assert_eq!(cpu.registers().xmm[1] as u64, 0x07_05_03_01_ff_fd_fb_f9u64);
+    }
+
+    #[test]
+    fn pslldq_shifts_the_full_register_by_bytes() {
+        let mut cpu = interpreter(&[
+            0x66, 0x0f, 0x73, 0xfa, 0x02, // pslldq xmm2, 2
+        ]);
+        cpu.registers_mut().xmm[2] = u128::from(0x1122_3344_5566_7788u64);
+
+        assert_eq!(cpu.step().unwrap(), StepOutcome::Continue);
+        assert_eq!(
+            cpu.registers().xmm[2],
+            u128::from(0x1122_3344_5566_7788u64) << 16
+        );
+    }
+
+    #[test]
+    fn bts_sets_the_selected_bit_and_cf() {
+        let mut cpu = interpreter(&[
+            0x48, 0x0f, 0xab, 0xf2, // bts rdx, rsi
+        ]);
+        cpu.registers_mut().rdx = 0b10;
+        cpu.registers_mut().rsi = 0;
+
+        assert_eq!(cpu.step().unwrap(), StepOutcome::Continue);
+        assert_eq!(cpu.registers().rdx, 0b11);
+        assert!(!cpu.registers().flag(FLAG_CF));
+    }
+
+    #[test]
+    fn xadd_swaps_source_and_writes_sum() {
+        let mut cpu = interpreter(&[
+            0x48, 0x0f, 0xc1, 0xd1, // xadd rcx, rdx
+        ]);
+        cpu.registers_mut().rcx = 5;
+        cpu.registers_mut().rdx = 7;
+
+        assert_eq!(cpu.step().unwrap(), StepOutcome::Continue);
+        assert_eq!(cpu.registers().rcx, 12);
+        assert_eq!(cpu.registers().rdx, 5);
     }
 
     #[test]

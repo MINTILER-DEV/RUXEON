@@ -278,6 +278,52 @@ fn run_until_exit(
                     unsupported_log.record(pid.0, &program, unsupported);
                     unsupported_log.print_summary();
                 }
+                if trace {
+                    eprintln!("recent guest instructions before failure:");
+                    for record in trace_records.iter().rev().take(64).rev() {
+                        eprintln!(
+                            "{:#018x}: {:<32} rax={:#x}->{:#x} rbx={:#x}->{:#x} rcx={:#x}->{:#x} rdx={:#x}->{:#x} rsi={:#x}->{:#x} rdi={:#x}->{:#x} rsp={:#x}->{:#x}",
+                            record.ip,
+                            record.instruction,
+                            record.before.rax,
+                            record.after.rax,
+                            record.before.rbx,
+                            record.after.rbx,
+                            record.before.rcx,
+                            record.after.rcx,
+                            record.before.rdx,
+                            record.after.rdx,
+                            record.before.rsi,
+                            record.after.rsi,
+                            record.before.rdi,
+                            record.after.rdi,
+                            record.before.rsp,
+                            record.after.rsp
+                        );
+                    }
+                    eprintln!("current block before failure:");
+                    for record in interpreter.trace().iter().rev().take(32).rev() {
+                        eprintln!(
+                            "{:#018x}: {:<32} rax={:#x}->{:#x} rbx={:#x}->{:#x} rcx={:#x}->{:#x} rdx={:#x}->{:#x} rsi={:#x}->{:#x} rdi={:#x}->{:#x} rsp={:#x}->{:#x}",
+                            record.ip,
+                            record.instruction,
+                            record.before.rax,
+                            record.after.rax,
+                            record.before.rbx,
+                            record.after.rbx,
+                            record.before.rcx,
+                            record.after.rcx,
+                            record.before.rdx,
+                            record.after.rdx,
+                            record.before.rsi,
+                            record.after.rsi,
+                            record.before.rdi,
+                            record.after.rdi,
+                            record.before.rsp,
+                            record.after.rsp
+                        );
+                    }
+                }
                 return Err(RunError::GuestStep {
                     pid: pid.0,
                     program,
