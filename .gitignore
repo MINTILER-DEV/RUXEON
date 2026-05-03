@@ -2,4 +2,4 @@
 /rootfs
 /target
 **/*.pdb
-**/*.trace.txt
+**/*trace.txt

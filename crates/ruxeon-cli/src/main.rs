@@ -351,6 +351,14 @@ fn run_until_exit(
             }
             StepOutcome::Syscall(trap) => {
                 let registers = *interpreter.registers();
+                if trace {
+                    println!(
+                        "LIVE TRACE: pid {} syscall {} args={:#x?}",
+                        record.process.pid(),
+                        trap.number,
+                        trap.args
+                    );
+                }
                 let outcome = SyscallDispatcher::dispatch_with_process_model(
                     &mut record.process,
                     &mut SyscallContext {
@@ -363,6 +371,9 @@ fn run_until_exit(
                     Some(process_table),
                     Some(registers),
                 );
+                if trace {
+                    println!("LIVE TRACE RET: {:?}", outcome);
+                }
                 interpreter.clear_block_cache();
                 interpreter.registers_mut().fs_base = record.process.fs_base();
                 match outcome {

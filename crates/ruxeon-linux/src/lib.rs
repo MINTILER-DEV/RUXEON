@@ -173,6 +173,7 @@ pub enum SyscallNumber {
     Getpid,
     Sendfile,
     Getppid,
+    Getpgrp,
     Gettid,
     Getuid,
     Getgid,
@@ -251,6 +252,7 @@ impl SyscallNumber {
             Self::Getegid => 108,
             Self::Setpgid => 109,
             Self::Getppid => 110,
+            Self::Getpgrp => 111,
             Self::Getpgid => 121,
             Self::Sigaltstack => 131,
             Self::Access => 21,
@@ -323,6 +325,7 @@ impl SyscallNumber {
             Self::Getpid => "getpid",
             Self::Sendfile => "sendfile",
             Self::Getppid => "getppid",
+            Self::Getpgrp => "getpgrp",
             Self::Gettid => "gettid",
             Self::Getuid => "getuid",
             Self::Getgid => "getgid",
@@ -411,6 +414,7 @@ impl From<u64> for SyscallNumber {
             108 => Self::Getegid,
             109 => Self::Setpgid,
             110 => Self::Getppid,
+            111 => Self::Getpgrp,
             121 => Self::Getpgid,
             131 => Self::Sigaltstack,
             158 => Self::ArchPrctl,
@@ -1348,6 +1352,7 @@ impl SyscallDispatcher {
             },
             SyscallNumber::Getpid => i64::from(process.pid),
             SyscallNumber::Getppid => i64::from(process.ppid),
+            SyscallNumber::Getpgrp | SyscallNumber::Getpgid => i64::from(process.pgid),
             SyscallNumber::Gettid => i64::from(process.tid),
             SyscallNumber::Getuid
             | SyscallNumber::Getgid
@@ -1361,7 +1366,6 @@ impl SyscallDispatcher {
                 };
                 0
             }
-            SyscallNumber::Getpgid => i64::from(process.pgid),
             SyscallNumber::Uname => {
                 write_uname(context.memory, args[0])?;
                 0

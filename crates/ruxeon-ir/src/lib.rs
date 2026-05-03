@@ -1,5 +1,6 @@
 //! Ruxeon IR block metadata and cache.
 
+use iced_x86::Register;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -14,12 +15,49 @@ pub enum IrInstructionKind {
     Syscall,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrOperand {
+    Reg(Register),
+    Imm(u64),
+    Mem {
+        base: Register,
+        index: Register,
+        scale: u8,
+        disp: i64,
+        size: u32,
+    },
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrOpcode {
+    Nop,
+    Mov,
+    Add,
+    Sub,
+    Xor,
+    And,
+    Or,
+    Cmp,
+    Test,
+    Push,
+    Pop,
+    Load,
+    Store,
+    Fallback,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IrInstruction {
     pub ip: u64,
     pub len: u8,
     pub text: String,
     pub kind: IrInstructionKind,
+    pub opcode: IrOpcode,
+    pub op0: IrOperand,
+    pub op1: IrOperand,
+    pub op2: IrOperand,
+    pub width: u32,
 }
 
 impl IrInstruction {
@@ -134,6 +172,11 @@ mod tests {
                 len: 1,
                 text: "nop".to_string(),
                 kind: IrInstructionKind::Compute,
+                opcode: IrOpcode::Nop,
+                op0: IrOperand::None,
+                op1: IrOperand::None,
+                op2: IrOperand::None,
+                width: 0,
             }],
             BlockTerminator::FallThrough,
         ));

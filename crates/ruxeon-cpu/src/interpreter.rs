@@ -412,6 +412,10 @@ impl Interpreter {
                 self.execute_packed_compare_equal(instruction)?;
                 StepOutcome::Continue
             }
+            Mnemonic::Pcmpgtb | Mnemonic::Pcmpgtw | Mnemonic::Pcmpgtd | Mnemonic::Pcmpgtq => {
+                self.execute_packed_compare_greater(instruction)?;
+                StepOutcome::Continue
+            }
             Mnemonic::Pmovmskb => {
                 self.execute_pmovmskb(instruction)?;
                 StepOutcome::Continue
@@ -600,6 +604,14 @@ impl Interpreter {
                 self.execute_bit_modify(instruction)?;
                 StepOutcome::Continue
             }
+            Mnemonic::Cld => {
+                self.registers.set_flag(FLAG_DF, false);
+                StepOutcome::Continue
+            }
+            Mnemonic::Std => {
+                self.registers.set_flag(FLAG_DF, true);
+                StepOutcome::Continue
+            }
             Mnemonic::Bsf => {
                 self.execute_bit_scan(instruction, BitScanOp::Forward)?;
                 StepOutcome::Continue
@@ -703,7 +715,12 @@ impl Interpreter {
                 self.write_operand(instruction, 0, value, width)?;
                 StepOutcome::Continue
             }
-            Mnemonic::Nop => StepOutcome::Continue,
+            Mnemonic::Nop
+            | Mnemonic::Prefetchnta
+            | Mnemonic::Prefetcht0
+            | Mnemonic::Prefetcht1
+            | Mnemonic::Prefetcht2
+            | Mnemonic::Prefetchw => StepOutcome::Continue,
             Mnemonic::Syscall => {
                 self.registers.rcx = next_ip;
                 self.registers.r11 = self.registers.rflags;
@@ -1209,6 +1226,32 @@ impl Interpreter {
         self.write_xmm_operand(instruction, 0, result)
     }
 
+    fn execute_packed_compare_greater(&mut self, instruction: &Instruction) -> Result<(), CpuError> {
+        let left = self.read_xmm_operand(instruction, 0)?;
+        let right = self.read_xmm_operand(instruction, 1)?;
+        let lane_bits = match instruction.mnemonic() {
+            Mnemonic::Pcmpgtb => 8,
+            Mnemonic::Pcmpgtw => 16,
+            Mnemonic::Pcmpgtd => 32,
+            Mnemonic::Pcmpgtq => 64,
+            _ => unreachable!("checked by caller"),
+        };
+        let lane_mask = mask(lane_bits) as u128;
+        let lanes = 128 / lane_bits;
+        let mut result = 0u128;
+        for lane in 0..lanes {
+            let shift = lane * lane_bits;
+            let left_lane = (left >> shift) & lane_mask;
+            let right_lane = (right >> shift) & lane_mask;
+            let left_signed = sign_extend(left_lane as u64, lane_bits) as i64;
+            let right_signed = sign_extend(right_lane as u64, lane_bits) as i64;
+            if left_signed > right_signed {
+                result |= lane_mask << shift;
+            }
+        }
+        self.write_xmm_operand(instruction, 0, result)
+    }
+
     fn execute_pmovmskb(&mut self, instruction: &Instruction) -> Result<(), CpuError> {
         let value = self.read_xmm_operand(instruction, 1)?;
         let mut result = 0u64;
@@ -1606,8 +1649,8 @@ impl Interpreter {
         let rhs = self.read_operand(instruction, 0, width)? & mask(width);
         let low = self.registers.rax & mask(width);
         let result = if signed {
-            let left = sign_extend(low, width) as i128;
-            let right = sign_extend(rhs, width) as i128;
+            let left = sign_extend(low, width) as i64 as i128;
+            let right = sign_extend(rhs, width) as i64 as i128;
             (left * right) as u128
         } else {
             u128::from(low) * u128::from(rhs)
@@ -1615,7 +1658,7 @@ impl Interpreter {
         self.write_mul_result(width, result);
         let overflow = if signed {
             let truncated = result as u64 & mask(width);
-            result as i128 != sign_extend(truncated, width) as i128
+            result as i128 != sign_extend(truncated, width) as i64 as i128
         } else {
             (result >> width) != 0
         };
@@ -1639,11 +1682,11 @@ impl Interpreter {
                 } else {
                     self.read_operand(instruction, 1, width)?
                 };
-                let result = (sign_extend(left, width) as i128)
-                    .wrapping_mul(sign_extend(right, width) as i128);
+                let result = (sign_extend(left, width) as i64 as i128)
+                    .wrapping_mul(sign_extend(right, width) as i64 as i128);
                 let truncated = result as u64 & mask(width);
                 self.write_operand(instruction, 0, truncated, width)?;
-                let overflow = result != sign_extend(truncated, width) as i128;
+                let overflow = result != sign_extend(truncated, width) as i64 as i128;
                 self.registers.set_flag(FLAG_CF, overflow);
                 self.registers.set_flag(FLAG_OF, overflow);
                 Ok(())
@@ -1662,7 +1705,7 @@ impl Interpreter {
             return Err(CpuError::DivideError(instruction.ip()));
         }
         if signed {
-            let divisor = sign_extend(divisor, width) as i128;
+            let divisor = sign_extend(divisor, width) as i64 as i128;
             let dividend = self.signed_dividend(width);
             let quotient = dividend / divisor;
             let remainder = dividend % divisor;
@@ -1742,15 +1785,15 @@ impl Interpreter {
 
     fn signed_dividend(&self, width: u32) -> i128 {
         match width {
-            8 => sign_extend(self.registers.rax & 0xffff, 16) as i128,
+            8 => sign_extend(self.registers.rax & 0xffff, 16) as i64 as i128,
             16 => sign_extend(
                 ((self.registers.rdx & 0xffff) << 16) | (self.registers.rax & 0xffff),
                 32,
-            ) as i128,
+            ) as i64 as i128,
             32 => sign_extend(
                 ((self.registers.rdx & 0xffff_ffff) << 32) | (self.registers.rax & 0xffff_ffff),
                 64,
-            ) as i128,
+            ) as i64 as i128,
             _ => {
                 let combined =
                     (u128::from(self.registers.rdx) << 64) | u128::from(self.registers.rax);
