@@ -74,6 +74,7 @@ mod tests {
                             break;
                         }
                         SyscallOutcome::Execve(_) => panic!("unexpected execve"),
+                        SyscallOutcome::Blocked => panic!("unexpected block"),
                     }
                 }
             }

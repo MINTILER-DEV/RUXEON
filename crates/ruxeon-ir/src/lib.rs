@@ -1,6 +1,5 @@
 //! Ruxeon IR block metadata and cache.
 
-use iced_x86::Register;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -15,49 +14,12 @@ pub enum IrInstructionKind {
     Syscall,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IrOperand {
-    Reg(Register),
-    Imm(u64),
-    Mem {
-        base: Register,
-        index: Register,
-        scale: u8,
-        disp: i64,
-        size: u32,
-    },
-    None,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IrOpcode {
-    Nop,
-    Mov,
-    Add,
-    Sub,
-    Xor,
-    And,
-    Or,
-    Cmp,
-    Test,
-    Push,
-    Pop,
-    Load,
-    Store,
-    Fallback,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IrInstruction {
     pub ip: u64,
     pub len: u8,
     pub text: String,
     pub kind: IrInstructionKind,
-    pub opcode: IrOpcode,
-    pub op0: IrOperand,
-    pub op1: IrOperand,
-    pub op2: IrOperand,
-    pub width: u32,
 }
 
 impl IrInstruction {
@@ -138,11 +100,39 @@ impl BlockCache {
         self.blocks.insert(block.id, block);
     }
 
+    /// Look up a block without updating hit/miss counters.
+    pub fn get_without_stats(&self, id: BasicBlockId) -> Option<&BasicBlock> {
+        self.blocks.get(&id)
+    }
+
+    /// Remove all cached blocks whose instruction range overlaps
+    /// `[addr, addr+size)`.  Returns the number of blocks removed.
+    pub fn invalidate_range(&mut self, addr: u64, size: u64) -> usize {
+        let end = addr.saturating_add(size);
+        let before = self.blocks.len();
+        self.blocks
+            .retain(|_, block| block.end_ip <= addr || block.start_ip >= end);
+        let removed = before - self.blocks.len();
+        if removed > 0 {
+            self.invalidations += removed as u64;
+        }
+        removed
+    }
+
     pub fn clear(&mut self) {
-        if !self.blocks.is_empty() {
-            self.invalidations += 1;
+        let count = self.blocks.len();
+        if count > 0 {
+            self.invalidations += count as u64;
         }
         self.blocks.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
     }
 
     pub fn stats(&self) -> BlockCacheStats {
@@ -172,11 +162,6 @@ mod tests {
                 len: 1,
                 text: "nop".to_string(),
                 kind: IrInstructionKind::Compute,
-                opcode: IrOpcode::Nop,
-                op0: IrOperand::None,
-                op1: IrOperand::None,
-                op2: IrOperand::None,
-                width: 0,
             }],
             BlockTerminator::FallThrough,
         ));
@@ -190,5 +175,74 @@ mod tests {
         cache.clear();
         assert_eq!(cache.stats().blocks, 0);
         assert_eq!(cache.stats().invalidations, 1);
+    }
+
+    #[test]
+    fn invalidate_range_removes_only_overlapping_blocks() {
+        let mut cache = BlockCache::default();
+
+        // Block A: covers [0x1000..0x1005)
+        cache.insert(BasicBlock::new(
+            0x1000,
+            vec![IrInstruction {
+                ip: 0x1000,
+                len: 5,
+                text: "call foo".to_string(),
+                kind: IrInstructionKind::Call,
+            }],
+            BlockTerminator::Call,
+        ));
+
+        // Block B: covers [0x2000..0x2003)
+        cache.insert(BasicBlock::new(
+            0x2000,
+            vec![
+                IrInstruction {
+                    ip: 0x2000,
+                    len: 1,
+                    text: "nop".to_string(),
+                    kind: IrInstructionKind::Compute,
+                },
+                IrInstruction {
+                    ip: 0x2001,
+                    len: 2,
+                    text: "ret".to_string(),
+                    kind: IrInstructionKind::Return,
+                },
+            ],
+            BlockTerminator::Return,
+        ));
+
+        // Block C: covers [0x3000..0x3002)
+        cache.insert(BasicBlock::new(
+            0x3000,
+            vec![IrInstruction {
+                ip: 0x3000,
+                len: 2,
+                text: "jmp short +0".to_string(),
+                kind: IrInstructionKind::Branch,
+            }],
+            BlockTerminator::Branch,
+        ));
+
+        assert_eq!(cache.len(), 3);
+
+        // Invalidate range [0x2001..0x2003) — only overlaps block B.
+        let removed = cache.invalidate_range(0x2001, 2);
+        assert_eq!(removed, 1);
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get_without_stats(BasicBlockId(0x1000)).is_some());
+        assert!(cache.get_without_stats(BasicBlockId(0x2000)).is_none());
+        assert!(cache.get_without_stats(BasicBlockId(0x3000)).is_some());
+
+        // Invalidate a range that doesn't overlap anything.
+        let removed = cache.invalidate_range(0x4000, 0x1000);
+        assert_eq!(removed, 0);
+        assert_eq!(cache.len(), 2);
+
+        // Invalidate a wide range covering both remaining blocks.
+        let removed = cache.invalidate_range(0x0000, 0x4000);
+        assert_eq!(removed, 2);
+        assert!(cache.is_empty());
     }
 }

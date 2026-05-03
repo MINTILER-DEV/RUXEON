@@ -112,6 +112,18 @@ impl ExecutionCache {
         self.ir.stats()
     }
 
+    /// Invalidate only the cached blocks that overlap `[addr, addr+size)`.
+    pub fn invalidate_range(&mut self, addr: u64, size: u64) -> usize {
+        let end = addr.saturating_add(size);
+        // Remove decoded entries whose block overlaps the written range.
+        self.decoded.retain(|id, _| {
+            self.ir
+                .get_without_stats(*id)
+                .map_or(true, |block| block.end_ip <= addr || block.start_ip >= end)
+        });
+        self.ir.invalidate_range(addr, size)
+    }
+
     pub fn clear(&mut self) {
         self.ir.clear();
         self.decoded.clear();
@@ -1991,7 +2003,7 @@ impl Interpreter {
                     .unwrap_or(false);
                 self.memory.write_bytes(address, &bytes)?;
                 if invalidate_cache {
-                    self.cache.clear();
+                    self.cache.invalidate_range(address, size as u64);
                 }
             }
             _ => {

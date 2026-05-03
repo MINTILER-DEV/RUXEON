@@ -374,7 +374,12 @@ fn run_until_exit(
                 if trace {
                     println!("LIVE TRACE RET: {:?}", outcome);
                 }
-                interpreter.clear_block_cache();
+                // Only invalidate the block cache for syscalls that alter the
+                // guest memory map (mmap, mprotect, munmap, brk).
+                const MEMORY_MODIFYING_SYSCALLS: &[u64] = &[9, 10, 11, 12];
+                if MEMORY_MODIFYING_SYSCALLS.contains(&trap.number) {
+                    interpreter.clear_block_cache();
+                }
                 interpreter.registers_mut().fs_base = record.process.fs_base();
                 match outcome {
                     SyscallOutcome::Return(value) => {
